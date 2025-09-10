@@ -88,21 +88,43 @@ static bool   g_InvertLookX = false; // RS.x
 static bool   g_InvertLookY = false; // RS.y
 static wchar_t g_IniPath[MAX_PATH] = L"";
 
+// ===== Crawl → mouse delta (no INI) =====
+static const float CRAWL_MOUSE_X_SENS = 1500.0f; // pixels/sec at full RS deflection
+static float s_CrawlMouseXAcc = 0.0f;           // fractional accumulator for dx
+
+// ===== LOAD CONFIG =====
+
+// Returns the folder of the current DLL (.asi)
+static void GetDllFolder(wchar_t* outPath, size_t size) {
+    HMODULE hMod = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        (LPCWSTR)&GetDllFolder, &hMod);
+
+    GetModuleFileNameW(hMod, outPath, (DWORD)size);
+
+    wchar_t* slash = wcsrchr(outPath, L'\\');
+    if (slash) *(slash + 1) = L'\0'; else wcscpy_s(outPath, size, L".\\");
+}
+
 static void MH2_LoadConfig()
 {
     if (!g_IniPath[0]) {
-        wchar_t exe[MAX_PATH];
-        GetModuleFileNameW(NULL, exe, MAX_PATH);
-        wchar_t* slash = wcsrchr(exe, L'\\');
-        if (slash) *(slash + 1) = L'\0'; else wcscpy_s(exe, L".\\");
-        wcscpy_s(g_IniPath, exe);
+        wchar_t dllDir[MAX_PATH];
+        GetDllFolder(dllDir, MAX_PATH);
+
+        // Always create in DLL folder
+        wcscpy_s(g_IniPath, dllDir);
         wcscat_s(g_IniPath, L"Manhunt2.XInput.ini");
     }
+
+    // Create ini with defaults if missing
     DWORD attr = GetFileAttributesW(g_IniPath);
     if (attr == INVALID_FILE_ATTRIBUTES) {
         WritePrivateProfileStringW(L"Camera", L"InvertLookX", L"0", g_IniPath);
         WritePrivateProfileStringW(L"Camera", L"InvertLookY", L"0", g_IniPath);
     }
+
     g_InvertLookX = GetPrivateProfileIntW(L"Camera", L"InvertLookX", 0, g_IniPath) != 0;
     g_InvertLookY = GetPrivateProfileIntW(L"Camera", L"InvertLookY", 0, g_IniPath) != 0;
 }
@@ -120,82 +142,71 @@ static inline float MH2_NormStick(int16_t v, int dz) {
 static inline bool HasFirearm(int w) {
     return (w == WEAPONTYPE_1HFIREARM || w == WEAPONTYPE_2HFIREARM);
 }
-static inline int TripletCapacity() {
-    uintptr_t bytes = (uintptr_t)gTripEnd - (uintptr_t)gTripBase;
-    return (int)(bytes / (sizeof(int) * 3)); // usually 10
-}
+// Simple rounding helper (no C99 dependency)
+static inline int RoundToInt(float v) { return (int)((v >= 0.0f) ? (v + 0.5f) : (v - 0.5f)); }
 
-// Internal mouse wheel codes
+// ===== Direct injection, identical to the engine's DI path =====
+// thunk to FUN_0056F577(kind, payload)
+typedef void(__cdecl* tEmitInput)(uint32_t kind, float* payload);
+static tEmitInput g_EmitInput = reinterpret_cast<tEmitInput>(0x0056F577);
+
+// Track which DIKs we’ve "pressed" so we can release them later.
+static bool sKeyDown[256] = { false };
+
+// NEVER emit wheel as a DIK; just in case it appears in binds
 static const int MWHEEL_UP_CODE = 0x95;
 static const int MWHEEL_DOWN_CODE = 0x96;
 
-// Scrub any wheel triplets in-place
-static inline void ScrubMouseWheelTriplets() {
-    volatile int* p = gTripBase;
-    while (p < gTripEnd) {
-        const int code = p[0];
-        if (code == MWHEEL_UP_CODE || code == MWHEEL_DOWN_CODE) {
-            p[1] = 0; p[2] = 0;
-        }
-        p += 3;
-    }
+static inline void EmitKeyDown_DIK(uint8_t dik) {
+    if (sKeyDown[dik]) return;
+    uint32_t u = dik; float f;
+    memcpy(&f, &u, sizeof(f));
+    g_EmitInput(0x12, &f);        // add/set pressed for this DIK
+    sKeyDown[dik] = true;
 }
-static inline void StripWheelCodes(int& n, int* codes, int* pressed) {
-    int j = 0;
-    for (int i = 0; i < n; ++i) {
-        const int c = codes[i];
-        if (c == MWHEEL_UP_CODE || c == MWHEEL_DOWN_CODE) continue;
-        if (j != i) { codes[j] = c; pressed[j] = pressed[i]; }
-        ++j;
-    }
-    n = j;
+static inline void EmitKeyUp_DIK(uint8_t dik) {
+    if (!sKeyDown[dik]) return;
+    uint32_t u = dik; float f;
+    memcpy(&f, &u, sizeof(f));
+    g_EmitInput(0x13, &f);        // mark event so aggregator consumes/removes entry next frame
+    sKeyDown[dik] = false;
 }
-static void WriteTripletsDeterministic(const int* codes, const int* pressed, int count) {
-    int cap = TripletCapacity();
-    if (count > cap) count = cap;
-    volatile int* p = gTripBase;
-    for (int i = 0; i < count; ++i) { p[0] = codes[i]; p[1] = pressed[i] ? 1 : 0; p[2] = 0; p += 3; }
-    if (count < cap) { p[0] = INPUT_SENTINEL; p[1] = 0; p[2] = 0; p += 3; }
-    while (p < gTripEnd) { p[0] = INPUT_SENTINEL; p[1] = 0; p[2] = 0; p += 3; }
+static inline void ReleaseAllTrackedKeys() {
+    for (int c = 1; c < 256; ++c) if (sKeyDown[c]) EmitKeyUp_DIK((uint8_t)c);
 }
-static inline void PublishBoundCodesSafe(int actionIdx, int& n, int* codes, int* pressed) {
-    auto push = [&](int c) {
-        if (!c || c == INPUT_SENTINEL) return;
-        if (c == MWHEEL_UP_CODE || c == MWHEEL_DOWN_CODE) return;
-        for (int i = 0; i < n; ++i) if (codes[i] == c) { pressed[i] = 1; return; }
-        codes[n] = c; pressed[n] = 1; ++n;
-        };
-    const int c1 = (int)(uint8_t)g_ActionMapPrimary[actionIdx].Code;
-    const int c2 = (int)(uint8_t)g_ActionMapSecondary[actionIdx].Code;
-    push(c1); if (c2 && c2 != c1) push(c2);
+
+// DIK selection helpers (respect user keybinds via action maps)
+static inline void DesireDIK(uint8_t dik, bool* desired) {
+    if (!dik || dik == INPUT_SENTINEL || dik == MWHEEL_UP_CODE || dik == MWHEEL_DOWN_CODE) return;
+    desired[dik] = true;
 }
-static inline void ScrubActionTriplets(int actionIdx) {
-    const int c1 = (int)(uint8_t)g_ActionMapPrimary[actionIdx].Code;
-    const int c2 = (int)(uint8_t)g_ActionMapSecondary[actionIdx].Code;
-    volatile int* p = gTripBase;
-    while (p < gTripEnd) {
-        const int code = p[0];
-        if (code == c1 || code == c2) { p[1] = 0; p[2] = 0; }
-        p += 3;
+static inline void DesireActionDIKs(int actionIdx, bool* desired) {
+    const uint8_t c1 = (uint8_t)g_ActionMapPrimary[actionIdx].Code;
+    const uint8_t c2 = (uint8_t)g_ActionMapSecondary[actionIdx].Code;
+    DesireDIK(c1, desired);
+    if (c2 && c2 != c1) DesireDIK(c2, desired);
+}
+static inline void ApplyDesiredKeys(bool* desired) {
+    for (int c = 1; c < 256; ++c) {
+        if (desired[c] && !sKeyDown[c]) EmitKeyDown_DIK((uint8_t)c);
+        else if (!desired[c] && sKeyDown[c]) EmitKeyUp_DIK((uint8_t)c);
     }
 }
 
-// Convert LS direction into pressed keyboard actions (respects user's keybinds via action maps)
-static inline void PublishMovementFromStickAsKeyboard(float lx, float ly, int& n, int* codes, int* pressed)
-{
-    // deadzone / threshold for discrete WASD
+// Convert LS to WASD (discrete) through binds
+static inline void DesireMovementFromStick(float lx, float ly, bool* desired) {
     const float TH = 0.35f;
-
-    if (ly > TH) PublishBoundCodesSafe(ACTION_MOVE_FORWARD, n, codes, pressed); // W
-    if (ly < -TH) PublishBoundCodesSafe(ACTION_MOVE_BACKWARDS, n, codes, pressed); // S
-    if (lx < -TH) PublishBoundCodesSafe(ACTION_MOVE_LEFT, n, codes, pressed); // A
-    if (lx > TH) PublishBoundCodesSafe(ACTION_MOVE_RIGHT, n, codes, pressed); // D
+    if (ly > TH) DesireActionDIKs(ACTION_MOVE_FORWARD, desired); // W
+    if (ly < -TH) DesireActionDIKs(ACTION_MOVE_BACKWARDS, desired); // S
+    if (lx < -TH) DesireActionDIKs(ACTION_MOVE_LEFT, desired); // A
+    if (lx > TH) DesireActionDIKs(ACTION_MOVE_RIGHT, desired); // D
 }
-
-
-// ==== OS-level mouse buttons (bumpers only): RB->LMB, LB->RMB ====
+// ==== OS-level mouse buttons & wheel ====
+// RB->LMB, LB->RMB, DPAD-DOWN -> Wheel Down (single pulse per press)
 static bool g_SysLMBDown = false;
 static bool g_SysRMBDown = false;
+static bool g_DDArmed = true; // re-arms when DPAD-DOWN is released
+
 static inline void EmitSystemLMB(bool down) {
     if (down == g_SysLMBDown) return;
     INPUT in = {}; in.type = INPUT_MOUSE;
@@ -210,42 +221,74 @@ static inline void EmitSystemRMB(bool down) {
     SendInput(1, &in, sizeof(in));
     g_SysRMBDown = down;
 }
+static inline void EmitSystemWheelDownPulse() {
+    INPUT in = {}; in.type = INPUT_MOUSE;
+    in.mi.dwFlags = MOUSEEVENTF_WHEEL;
+    in.mi.mouseData = (DWORD)(-WHEEL_DELTA); // negative = wheel down
+    SendInput(1, &in, sizeof(in));
+}
+// OS-level relative mouse movement
+static inline void EmitSystemMouseMoveDelta(int dx, int dy) {
+    if (dx == 0 && dy == 0) return;
+    INPUT in = {}; in.type = INPUT_MOUSE;
+    in.mi.dwFlags = MOUSEEVENTF_MOVE;
+    in.mi.dx = dx; in.mi.dy = dy;
+    SendInput(1, &in, sizeof(in));
+}
+
+static bool g_PrevDD = false;
 
 // ==========================
 // Init
 // ==========================
 static void MH2_InitXInput() {
     if (g_XIInited) return;
+
     const wchar_t* dlls[] = { L"xinput1_3.dll", L"xinput1_4.dll", L"xinput9_1_0.dll" };
-    for (auto dll : dlls) { g_hXInput = LoadLibraryW(dll); if (g_hXInput) break; }
+    for (auto dll : dlls) {
+        g_hXInput = LoadLibraryW(dll);
+        if (g_hXInput) break;
+    }
+
     if (g_hXInput) {
         g_XIGetState = reinterpret_cast<PFN_XInputGetState>(GetProcAddress(g_hXInput, "XInputGetState"));
         g_XIEnable = reinterpret_cast<PFN_XInputEnable>(GetProcAddress(g_hXInput, "XInputEnable"));
         if (g_XIEnable) g_XIEnable(TRUE);
+        g_PrevDD = false; // reset DPAD-down edge state
     }
-    g_XIInited = true;
+
+    // Always load/create INI once
     MH2_LoadConfig();
+
+    // Mark init done whether or not XInput loaded (prevents re-running every frame)
+    g_XIInited = true;
 }
 
 // ==========================
 // Per-frame glue
 // ==========================
 static void MH2_UpdateXInputForPlayer(void* playerInst) {
-    ScrubMouseWheelTriplets();
     MH2_InitXInput();
-    if (!g_XIEnabled || !g_XIGetState) return;
-
-    MH2_XINPUT_STATE st{}; DWORD xi = g_XIGetState(0, &st);
-
-    bool hasFirearmForThisFrame = false;
-    if (playerInst) {
-        int* PlrCurrWpnType = (int*)((char*)playerInst + 968);
-        hasFirearmForThisFrame = PlrCurrWpnType && HasFirearm(*PlrCurrWpnType);
+    if (!g_XIEnabled || !g_XIGetState) {
+        // No pad: zero sticks, release keys and system mouse buttons
+        if (playerInst) {
+            float* L = (float*)((char*)playerInst + 1168);
+            float* R = (float*)((char*)playerInst + 1184);
+            L[0] = L[1] = R[0] = R[1] = 0.0f;
+        }
+        *g_LS_X = *g_LS_Y = *g_RS_X = *g_RS_Y = 0.0f;
+        *g_PadFlags = 0;
+        *g_ImmFlags &= ~(IM_RS_PRESENT);
+        EmitSystemLMB(false);
+        EmitSystemRMB(false);
+        ReleaseAllTrackedKeys();
+        g_DDArmed = true; // re-arm DPAD-DOWN wheel
+        s_CrawlMouseXAcc = 0.0f;
+        return;
     }
 
-    // Triplet buffers (we'll also add movement into these when crawling)
-    int  codes[16];  int pressed[16]; int n = 0;
-
+    MH2_XINPUT_STATE st{};
+    DWORD xi = g_XIGetState(0, &st);
     if (xi != ERROR_SUCCESS) {
         if (playerInst) {
             float* L = (float*)((char*)playerInst + 1168);
@@ -257,8 +300,9 @@ static void MH2_UpdateXInputForPlayer(void* playerInst) {
         *g_ImmFlags &= ~(IM_RS_PRESENT);
         EmitSystemLMB(false);
         EmitSystemRMB(false);
-        WriteTripletsDeterministic(codes, pressed, 0);
-        ScrubMouseWheelTriplets();
+        ReleaseAllTrackedKeys();
+        g_DDArmed = true; // re-arm DPAD-DOWN wheel
+        s_CrawlMouseXAcc = 0.0f;
         return;
     }
 
@@ -269,19 +313,34 @@ static void MH2_UpdateXInputForPlayer(void* playerInst) {
     float rx = MH2_NormStick(st.Gamepad.sThumbRX, DZ_R);
     float ry = MH2_NormStick(st.Gamepad.sThumbRY, DZ_R);
 
-    // Determine crawl state
+    // crawl state (affects movement input path)
     bool isCrawling = false;
-    int* PlrCurrState = nullptr;
     if (playerInst) {
-        PlrCurrState = (int*)((char*)playerInst + 956); // same offset you use elsewhere
+        int* PlrCurrState = (int*)((char*)playerInst + 956);
         isCrawling = (PlrCurrState && *PlrCurrState == PEDSTATE_CRAWL);
     }
 
-    // Publish LS and flags normally, BUT override while crawling
-    *g_LS_X = lx;
-    *g_LS_Y = ly;
+    // While crawling, drive rotation via OS mouse delta from RS.x
+    if (isCrawling) {
+        const float dt = *(float*)0x6ECE68;           // engine delta time
+        const float dxF = rx * dt * CRAWL_MOUSE_X_SENS;
+        s_CrawlMouseXAcc += dxF;
+        const int dx = RoundToInt(s_CrawlMouseXAcc);
+        if (dx != 0) {
+            EmitSystemMouseMoveDelta(dx, 0);
+            s_CrawlMouseXAcc -= (float)dx;
+        }
+    }
+    else {
+        s_CrawlMouseXAcc = 0.0f; // reset accumulator when leaving crawl
+    }
 
-    {   // LS flags (used by engine); clear them when crawling
+    // Publish LS (zeroed when crawling so engine analog move path is disabled)
+    *g_LS_X = isCrawling ? 0.0f : lx;
+    *g_LS_Y = isCrawling ? 0.0f : ly;
+
+    // Engine LS/RS flag bits (preserved behavior)
+    {
         const float TH = 0.5f;
         uint32_t A = 0;
         if (fabsf(lx) > 1e-5f || fabsf(ly) > 1e-5f) A |= 0x40000000;
@@ -295,15 +354,15 @@ static void MH2_UpdateXInputForPlayer(void* playerInst) {
     if (playerInst) {
         float* L = (float*)((char*)playerInst + 1168);
         float* R = (float*)((char*)playerInst + 1184);
-        // If crawling, zero LS to fully disable analog move for the engine path
         L[0] = isCrawling ? 0.0f : lx;
         L[1] = isCrawling ? 0.0f : ly;
-        R[0] = rx;
+        // Suppress RS.x when crawling so internal yaw patch doesn't also turn
+        R[0] = isCrawling ? 0.0f : rx;
         R[1] = ry;
     }
     if (fabsf(rx) > 1e-4f || fabsf(ry) > 1e-4f) *g_ImmFlags |= IM_RS_PRESENT; else *g_ImmFlags &= ~IM_RS_PRESENT;
 
-    // --- buttons → actions ---
+    // --- buttons → desired DIKs this frame ---
     const uint16_t wb = st.Gamepad.wButtons;
     const bool A = (wb & XI_A) != 0;
     const bool B = (wb & XI_B) != 0;
@@ -312,6 +371,7 @@ static void MH2_UpdateXInputForPlayer(void* playerInst) {
     const bool LB = (wb & XI_LEFT_SHOULDER) != 0;
     const bool RB = (wb & XI_RIGHT_SHOULDER) != 0;
     const bool L3 = (wb & XI_LEFT_THUMB) != 0;
+    const bool R3 = (wb & XI_RIGHT_THUMB) != 0;
     const bool DUp = (wb & XI_DPAD_UP) != 0;
     const bool DL = (wb & XI_DPAD_LEFT) != 0;
     const bool DR = (wb & XI_DPAD_RIGHT) != 0;
@@ -325,38 +385,41 @@ static void MH2_UpdateXInputForPlayer(void* playerInst) {
     EmitSystemLMB(RB);
     EmitSystemRMB(LB);
 
-    // --- PUBLISH ACTIONS ---
-    if (A)     PublishBoundCodesSafe(ACTION_USE, n, codes, pressed);
-    if (Y)     PublishBoundCodesSafe(ACTION_WALLSQUASH, n, codes, pressed);
-    if (DD)    PublishBoundCodesSafe(ACTION_INVENTORY_SLOT2, n, codes, pressed);
-    if (DUp)   PublishBoundCodesSafe(ACTION_RELOAD, n, codes, pressed);
-    if (B)     PublishBoundCodesSafe(ACTION_PICKUP, n, codes, pressed);
-    if (Xb)    PublishBoundCodesSafe(ACTION_BLOCK, n, codes, pressed);
-    if (L3)    PublishBoundCodesSafe(ACTION_GRAPPLE, n, codes, pressed);
-    if (DL)    PublishBoundCodesSafe(ACTION_PEEKL, n, codes, pressed);
-    if (DR)    PublishBoundCodesSafe(ACTION_PEEKR, n, codes, pressed);
-    if (RT)    PublishBoundCodesSafe(ACTION_LOOKBACK, n, codes, pressed);
-    if (LT)    PublishBoundCodesSafe(ACTION_RUN, n, codes, pressed);
-    if (Start) PublishBoundCodesSafe(ACTION_MENU, n, codes, pressed);
-    if (Back)  PublishBoundCodesSafe(ACTION_INVENT_SWAP, n, codes, pressed);
-
-    // --- CRAWL OVERRIDE: LS → WASD via keyboard provider ---
-    if (isCrawling) {
-        // Ensure analog is fully ignored for movement
-        *g_LS_X = 0.0f;
-        *g_LS_Y = 0.0f;
-
-        // Convert LS axes to movement key actions (uses user’s keybinds)
-        PublishMovementFromStickAsKeyboard(lx, ly, n, codes, pressed);
+    // DPAD Down -> one-shot OS mouse wheel down; must release to re-arm
+    if (DD && g_DDArmed) {
+        EmitSystemWheelDownPulse();
+        g_DDArmed = false;
+    }
+    else if (!DD) {
+        g_DDArmed = true;
     }
 
-    // Finalize triplets (deterministic, wheel scrub like before)
-    StripWheelCodes(n, codes, pressed);
-    WriteTripletsDeterministic(codes, pressed, n);
-    ScrubMouseWheelTriplets();
+    bool desired[256] = { false };
+
+    // Actions mapped to keyboard (respect user binds)
+    if (A)     DesireActionDIKs(ACTION_USE, desired);
+    if (Y)     DesireActionDIKs(ACTION_WALLSQUASH, desired);
+    if (DD)    DesireActionDIKs(ACTION_INVENTORY_SLOT_DOWN, desired);
+    if (DUp)   DesireActionDIKs(ACTION_RELOAD, desired);
+    if (B)     DesireActionDIKs(ACTION_PICKUP, desired);
+    if (Xb)    DesireActionDIKs(ACTION_BLOCK, desired);
+    if (L3)    DesireActionDIKs(ACTION_TOGGLE_TORCH, desired);
+    if (R3)    DesireActionDIKs(ACTION_CROUCH, desired);
+    if (DL)    DesireActionDIKs(ACTION_PEEKL, desired);
+    if (DR)    DesireActionDIKs(ACTION_PEEKR, desired);
+    if (RT)    DesireActionDIKs(ACTION_LOOKBACK, desired);
+    if (LT)    DesireActionDIKs(ACTION_RUN, desired);
+    if (Start) DesireActionDIKs(ACTION_MENU, desired);
+    if (Back)  DesireActionDIKs(ACTION_INVENT_SWAP, desired);
+
+    // While crawling: convert LS to discrete movement keys via binds
+    if (isCrawling) {
+        DesireMovementFromStick(lx, ly, desired);
+    }
+
+    // Apply DIK downs/ups based on current desired set
+    ApplyDesiredKeys(desired);
 }
-
-
 
 // =====================================================================
 // Camera patch – RS yaw+pitch
