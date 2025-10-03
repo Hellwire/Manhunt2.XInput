@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 #include "pch.h"
 #include "XInput.h"
 #include "MemoryMgr.h"
@@ -8,11 +8,14 @@
 
 #include <windows.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdarg.h>
 #include <math.h>
 #include <string.h>
 #include <wchar.h>
 #include "CInput.h"
 #include "keyboard.h"
+
 
 // =========================
 // XInput shims / structures
@@ -64,6 +67,12 @@ static volatile float* const g_StruggleX = (float*)0x0076BE64;
 static volatile float* const g_StruggleY = (float*)0x0076BE68;
 
 static const uint32_t IM_RS_PRESENT = 0x400;  // case 0x0F
+// Sniper/scoped zoom state flag used by the camera logic
+static volatile bool* const g_SniperZoom = (bool*)0x0075B348;
+
+// Scoped aim deltas (degrees per frame), produced in input update and consumed in camera
+static float g_ScopedYawDeltaDeg = 0.0f;
+static float g_ScopedPitchDeltaDeg = 0.0f;
 
 // ===== triplet table scanned by the keyboard provider =====
 static volatile int* const gTripBase = (int*)0x0076BEA0; // [code, pressed, extra] x N
@@ -72,6 +81,58 @@ static volatile int* const gTripEnd = (int*)0x0076BF18;
 // ===== mapping tables (primary/secondary) =====
 static KeyCode* const g_ActionMapPrimary = (KeyCode*)0x0076E1C8;
 static KeyCode* const g_ActionMapSecondary = (KeyCode*)0x0076E2A0;
+
+// ===== Config (INI) =====
+static bool   g_InvertLookX = false; // RS.x
+static bool   g_InvertLookY = false; // RS.y
+static wchar_t g_IniPath[MAX_PATH] = L"";
+
+// === NEW: General config flags ===
+static bool g_ModEnabled = true;            // [General] EnableMod
+static bool g_BlockOnConflict = true;       // [General] BlockIfConflicts
+static bool g_LogToConsole = true;          // [General] LogToConsole
+// -1 = ignore (do nothing), 0 = force cursor HIDDEN when pad connected, 1 = force VISIBLE when pad connected
+static int  g_MouseCursorWithGamepad = -1;  // [General] MouseCursorWithGamepad
+
+// === NEW: console logging ===
+static bool g_ConsoleReady = false;
+static void MH2_EnsureConsole() {
+    if (g_LogToConsole && !g_ConsoleReady) {
+        AllocConsole();
+        FILE* f;
+        freopen_s(&f, "CONOUT$", "w", stdout);
+        freopen_s(&f, "CONOUT$", "w", stderr);
+        g_ConsoleReady = true;
+    }
+}
+static void MH2_Log(const wchar_t* fmt, ...) {
+    wchar_t buf[512];
+    va_list args; va_start(args, fmt);
+    _vsnwprintf_s(buf, _TRUNCATE, fmt, args);
+    va_end(args);
+    OutputDebugStringW(buf);
+    OutputDebugStringW(L"\n");
+    if (g_LogToConsole && g_ConsoleReady) {
+        wprintf(L"%s\n", buf);
+    }
+}
+
+// === NEW: small helpers ===
+static bool FileExistsW(const wchar_t* path) {
+    DWORD a = GetFileAttributesW(path);
+    return (a != INVALID_FILE_ATTRIBUTES) && !(a & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+// === NEW: cursor control when gamepad connects ===
+static int  g_LastCursorTarget = -2;      // -2 = unknown, 0 = hidden, 1 = shown
+static bool g_LastGamepadConnected = false;
+
+static void EnsureCursorVisible(bool show) {
+    // Drive ShowCursor's internal counter to the desired state
+    if (show) { while (ShowCursor(TRUE) < 0) {} }
+    else { while (ShowCursor(FALSE) >= 0) {} }
+}
+
 
 // ===== XInput ====
 typedef DWORD(WINAPI* PFN_XInputGetState)(DWORD, MH2_XINPUT_STATE*);
@@ -84,14 +145,21 @@ static bool               g_XIEnabled = true;
 
 extern "C" void __cdecl MH2_XInputEnableShim(uint8_t enable) { g_XIEnabled = (enable != 0); }
 
-// ===== Config (INI) =====
-static bool   g_InvertLookX = false; // RS.x
-static bool   g_InvertLookY = false; // RS.y
-static wchar_t g_IniPath[MAX_PATH] = L"";
-
 // ===== Crawl → mouse delta (no INI) =====
 static const float CRAWL_MOUSE_X_SENS = 1500.0f; // pixels/sec at full RS deflection
 static float s_CrawlMouseXAcc = 0.0f;           // fractional accumulator for dx
+
+// Aim → mouse delta (for firearms, e.g., sniper scope)
+static const float AIM_MOUSE_X_SENS = 2000.0f;   // pixels/sec at full RS deflection
+static const float AIM_MOUSE_Y_SENS = 2000.0f;
+static float s_AimMouseXAcc = 0.0f;
+static float s_AimMouseYAcc = 0.0f;
+
+// Camera sensitivity constants (configurable via INI)
+static float CAM_YAW_SENS = 20.0f; // deg/sec scale
+static float CAM_PITCH_SENS = 20.0f;
+static float AIM_MOUSE_X_SENS_CONFIG = 2000.0f; // pixels/sec at full RS deflection
+static float AIM_MOUSE_Y_SENS_CONFIG = 2000.0f;
 
 
 static volatile int* const gTripPressedBase = (int*)0x0076BEA4;
@@ -117,7 +185,7 @@ static void MH2_LoadConfig()
         wchar_t dllDir[MAX_PATH];
         GetDllFolder(dllDir, MAX_PATH);
 
-        // Always create in DLL folder
+        // Always create/read INI in DLL folder
         wcscpy_s(g_IniPath, dllDir);
         wcscat_s(g_IniPath, L"Manhunt2.XInput.ini");
     }
@@ -125,12 +193,61 @@ static void MH2_LoadConfig()
     // Create ini with defaults if missing
     DWORD attr = GetFileAttributesW(g_IniPath);
     if (attr == INVALID_FILE_ATTRIBUTES) {
+        // General defaults
+        WritePrivateProfileStringW(L"General", L"EnableMod", L"1", g_IniPath);
+        WritePrivateProfileStringW(L"General", L"BlockIfConflicts", L"1", g_IniPath);
+        WritePrivateProfileStringW(L"General", L"LogToConsole", L"1", g_IniPath);
+        // -1 ignore, 0 = hide cursor on pad connect, 1 = show cursor on pad connect
+        WritePrivateProfileStringW(L"General", L"MouseCursorWithGamepad", L"-1", g_IniPath);
+
+        // Existing camera defaults
         WritePrivateProfileStringW(L"Camera", L"InvertLookX", L"0", g_IniPath);
         WritePrivateProfileStringW(L"Camera", L"InvertLookY", L"0", g_IniPath);
+        
+        // Sensitivity defaults
+        WritePrivateProfileStringW(L"Camera", L"YawSensitivity", L"20.0", g_IniPath);
+        WritePrivateProfileStringW(L"Camera", L"PitchSensitivity", L"20.0", g_IniPath);
+        WritePrivateProfileStringW(L"Aim", L"MouseXSensitivity", L"2000.0", g_IniPath);
+        WritePrivateProfileStringW(L"Aim", L"MouseYSensitivity", L"2000.0", g_IniPath);
     }
+
+    // Read values
+    g_ModEnabled = GetPrivateProfileIntW(L"General", L"EnableMod", 1, g_IniPath) != 0;
+    g_BlockOnConflict = GetPrivateProfileIntW(L"General", L"BlockIfConflicts", 1, g_IniPath) != 0;
+    g_LogToConsole = GetPrivateProfileIntW(L"General", L"LogToConsole", 1, g_IniPath) != 0;
+    g_MouseCursorWithGamepad = GetPrivateProfileIntW(L"General", L"MouseCursorWithGamepad", -1, g_IniPath);
 
     g_InvertLookX = GetPrivateProfileIntW(L"Camera", L"InvertLookX", 0, g_IniPath) != 0;
     g_InvertLookY = GetPrivateProfileIntW(L"Camera", L"InvertLookY", 0, g_IniPath) != 0;
+    
+    // Read sensitivity values
+    wchar_t sensBuf[32];
+    GetPrivateProfileStringW(L"Camera", L"YawSensitivity", L"20.0", sensBuf, 32, g_IniPath);
+    CAM_YAW_SENS = (float)_wtof(sensBuf);
+    GetPrivateProfileStringW(L"Camera", L"PitchSensitivity", L"20.0", sensBuf, 32, g_IniPath);
+    CAM_PITCH_SENS = (float)_wtof(sensBuf);
+    GetPrivateProfileStringW(L"Aim", L"MouseXSensitivity", L"2000.0", sensBuf, 32, g_IniPath);
+    AIM_MOUSE_X_SENS_CONFIG = (float)_wtof(sensBuf);
+    GetPrivateProfileStringW(L"Aim", L"MouseYSensitivity", L"2000.0", sensBuf, 32, g_IniPath);
+    AIM_MOUSE_Y_SENS_CONFIG = (float)_wtof(sensBuf);
+}
+
+static bool HasConflictingASI() {
+    // Check already-loaded modules (case-insensitive names work)
+    if (GetModuleHandleW(L"absolutecamera.asi") || GetModuleHandleW(L"AbsoluteCamera.asi") ||
+        GetModuleHandleW(L"mh2patch.asi") || GetModuleHandleW(L"MH2Patch.asi"))
+        return true;
+
+    // Also check if the files just exist in the same folder as this ASI
+    wchar_t dir[MAX_PATH]; GetDllFolder(dir, MAX_PATH);
+    const wchar_t* names[] = { L"absolutecamera.asi", L"AbsoluteCamera.asi",
+                               L"mh2patch.asi",       L"MH2Patch.asi" };
+    wchar_t path[MAX_PATH];
+    for (auto n : names) {
+        wcscpy_s(path, dir); wcscat_s(path, n);
+        if (FileExistsW(path)) return true;
+    }
+    return false;
 }
 
 // ==== helpers ====
@@ -420,7 +537,12 @@ static void MH2_InitXInput() {
 
     // Always load/create INI once
     MH2_LoadConfig();
-
+    MH2_EnsureConsole();
+    MH2_Log(L"[XInput] Config: EnableMod=%d, BlockIfConflicts=%d, LogToConsole=%d, MouseCursorWithGamepad=%d, InvertX=%d, InvertY=%d",
+        (int)g_ModEnabled, (int)g_BlockOnConflict, (int)g_LogToConsole, g_MouseCursorWithGamepad,
+        (int)g_InvertLookX, (int)g_InvertLookY);
+    MH2_Log(L"[XInput] Sensitivity: Yaw=%.1f, Pitch=%.1f, AimX=%.1f, AimY=%.1f",
+        CAM_YAW_SENS, CAM_PITCH_SENS, AIM_MOUSE_X_SENS_CONFIG, AIM_MOUSE_Y_SENS_CONFIG);
     // Mark init done whether or not XInput loaded (prevents re-running every frame)
     g_XIInited = true;
 }
@@ -428,6 +550,9 @@ static void MH2_InitXInput() {
 // ==========================
 // Per-frame glue
 // ==========================
+static const int STICK_DEADZONE_L = 7849;
+static const int STICK_DEADZONE_R = 8689;
+
 static void MH2_UpdateXInputForPlayer(void* playerInst) {
     MH2_InitXInput();
 
@@ -451,6 +576,7 @@ static void MH2_UpdateXInputForPlayer(void* playerInst) {
         g_DDArmed = true;
         s_CrawlMouseXAcc = 0.0f;
         sWasInMenu = false;
+        if (g_LastGamepadConnected) { g_LastGamepadConnected = false; MH2_Log(L"[XInput] Gamepad disconnected (module disabled or XI missing)"); }
         return;
     }
 
@@ -463,7 +589,21 @@ static void MH2_UpdateXInputForPlayer(void* playerInst) {
         g_DDArmed = true;
         s_CrawlMouseXAcc = 0.0f;
         sWasInMenu = false;
+        if (g_LastGamepadConnected) { g_LastGamepadConnected = false; MH2_Log(L"[XInput] Gamepad disconnected"); }
         return;
+    }
+
+    if (!g_LastGamepadConnected) {
+        g_LastGamepadConnected = true;
+        MH2_Log(L"[XInput] Gamepad connected");
+    }
+    if (g_MouseCursorWithGamepad != -1) {
+        if (g_LastCursorTarget != g_MouseCursorWithGamepad) {
+            EnsureCursorVisible(g_MouseCursorWithGamepad == 1);
+            g_LastCursorTarget = g_MouseCursorWithGamepad;
+            MH2_Log(L"[XInput] Forcing cursor %s (per INI, on pad connect)",
+                (g_MouseCursorWithGamepad == 1) ? L"VISIBLE" : L"HIDDEN");
+        }
     }
 
     const bool inMenu = IsMenuActive();
@@ -487,19 +627,11 @@ static void MH2_UpdateXInputForPlayer(void* playerInst) {
     if (sWasInMenu) { ReleaseAllTrackedKeys(); sWasInMenu = false; }
 
 
-    // leaving menu: one-time cleanup then resume gameplay
-    if (sWasInMenu) {
-        ReleaseAllTrackedKeys(); // in case menu left something pressed
-        sWasInMenu = false;
-    }
-
-
     // --- sticks (LS/RS) ---
-    const int DZ_L = 7849, DZ_R = 8689;
-    float lx = MH2_NormStick(st.Gamepad.sThumbLX, DZ_L);
-    float ly = MH2_NormStick(st.Gamepad.sThumbLY, DZ_L);
-    float rx = MH2_NormStick(st.Gamepad.sThumbRX, DZ_R);
-    float ry = MH2_NormStick(st.Gamepad.sThumbRY, DZ_R);
+    float lx = MH2_NormStick(st.Gamepad.sThumbLX, STICK_DEADZONE_L);
+    float ly = MH2_NormStick(st.Gamepad.sThumbLY, STICK_DEADZONE_L);
+    float rx = MH2_NormStick(st.Gamepad.sThumbRX, STICK_DEADZONE_R);
+    float ry = MH2_NormStick(st.Gamepad.sThumbRY, STICK_DEADZONE_R);
 
     // crawl state (affects movement input path)
     bool isCrawling = false;
@@ -510,7 +642,7 @@ static void MH2_UpdateXInputForPlayer(void* playerInst) {
 
     if (isCrawling) {
         const float dt = *(float*)0x6ECE68;
-        const float dxF = rx * dt * CRAWL_MOUSE_X_SENS;
+        const float dxF = rx * dt * CRAWL_MOUSE_X_SENS * (g_InvertLookX ? 1.0f : -1.0f);
         s_CrawlMouseXAcc += dxF;
         const int dx = RoundToInt(s_CrawlMouseXAcc);
         if (dx != 0) {
@@ -522,8 +654,67 @@ static void MH2_UpdateXInputForPlayer(void* playerInst) {
         s_CrawlMouseXAcc = 0.0f;
     }
 
-    *g_LS_X = isCrawling ? 0.0f : lx;
-    *g_LS_Y = isCrawling ? 0.0f : ly;
+    // Detect firearm aim (sniper and other scoped modes)
+    bool firearmAimNow = false;
+    bool scopedZoom = false;
+    if (playerInst) {
+        const bool rmbHeld = g_SysRMBDown;
+        int* PlrCurrState = (int*)((char*)playerInst + 956);
+        int* PlrCurrWpnType = (int*)((char*)playerInst + 968);
+        int* PlrLockOnHunter = (int*)((char*)playerInst + 4500);
+        bool* PlrActionLockOn = (bool*)((char*)playerInst + 1352);
+        const bool inAimState = (PlrCurrState && (*PlrCurrState == PEDSTATE_AIM || *PlrCurrState == PEDSTATE_CROUCHAIM)) ||
+            (PlrLockOnHunter && *PlrLockOnHunter && PlrActionLockOn && *PlrActionLockOn);
+        const bool hasFirearmNow = (PlrCurrWpnType) ? HasFirearm(*PlrCurrWpnType) : false;
+        firearmAimNow = hasFirearmNow && (rmbHeld || inAimState);
+        
+        // Detect scoped weapons (sniper rifles) by weapon type
+        if (firearmAimNow && PlrCurrWpnType) {
+            // Assume sniper rifles are 2H firearms - adjust if needed
+            scopedZoom = (*PlrCurrWpnType == WEAPONTYPE_2HFIREARM);
+            static bool lastScopedState = false;
+            if (scopedZoom && !lastScopedState) {
+                MH2_Log(L"[XInput] Scoped weapon detected - using mouse-only aim");
+                lastScopedState = true;
+            } else if (!scopedZoom && lastScopedState) {
+                MH2_Log(L"[XInput] Scoped weapon ended - returning to normal aim");
+                lastScopedState = false;
+            }
+        }
+    }
+
+    if (firearmAimNow) {
+        const float dt = *(float*)0x6ECE68;
+        // Always drive yaw by mouse X while aiming (apply invert settings - flipped to match normal camera)
+        const float dxF = rx * dt * AIM_MOUSE_X_SENS_CONFIG * (g_InvertLookX ? 1.0f : -1.0f);
+        s_AimMouseXAcc += dxF;
+        int dx = RoundToInt(s_AimMouseXAcc);
+        int dy = 0;
+        if (scopedZoom) {
+            // In scoped/sniper, also drive pitch via mouse Y and suppress pad axes later
+            const float dyF = -ry * dt * AIM_MOUSE_Y_SENS_CONFIG * (g_InvertLookY ? 1.0f : -1.0f); // RS up -> mouse up
+            s_AimMouseYAcc += dyF;
+            dy = RoundToInt(s_AimMouseYAcc);
+            // Produce explicit camera deltas in degrees for scoped mode (apply invert settings - flipped to match normal camera)
+            g_ScopedYawDeltaDeg += rx * dt * CAM_YAW_SENS * (g_InvertLookX ? 1.0f : -1.0f);
+            g_ScopedPitchDeltaDeg += ry * dt * CAM_PITCH_SENS * (g_InvertLookY ? 1.0f : -1.0f);
+        } else {
+            // Non-scoped firearm aim: leave pitch to RS.y (avoid double input)
+            s_AimMouseYAcc = 0.0f;
+        }
+        if (dx != 0 || dy != 0) {
+            EmitSystemMouseMoveDelta(dx, dy);
+            s_AimMouseXAcc -= (float)dx;
+            if (dy != 0) s_AimMouseYAcc -= (float)dy;
+        }
+    }
+    else {
+        s_AimMouseXAcc = 0.0f;
+        s_AimMouseYAcc = 0.0f;
+    }
+
+    *g_LS_X = (isCrawling || firearmAimNow) ? 0.0f : lx;
+    *g_LS_Y = (isCrawling || firearmAimNow) ? 0.0f : ly;
 
     {
         const float TH = 0.5f;
@@ -531,19 +722,44 @@ static void MH2_UpdateXInputForPlayer(void* playerInst) {
         if (fabsf(lx) > 1e-5f || fabsf(ly) > 1e-5f) A |= 0x40000000;
         if (lx < -TH) A |= 0x00040000; else if (lx > TH) A |= 0x00080000;
         if (ly < -TH) A |= 0x00020000; else if (ly > TH) A |= 0x00010000;
-        *g_PadFlags = isCrawling ? 0u : A;
+        *g_PadFlags = (isCrawling || firearmAimNow) ? 0u : A;
     }
 
     *g_RS_X = 0.0f; *g_RS_Y = 0.0f;
     if (playerInst) {
         float* L = (float*)((char*)playerInst + 1168);
         float* R = (float*)((char*)playerInst + 1184);
-        L[0] = isCrawling ? 0.0f : lx;
-        L[1] = isCrawling ? 0.0f : ly;
-        R[0] = isCrawling ? 0.0f : rx;
-        R[1] = ry;
+        L[0] = (isCrawling || firearmAimNow) ? 0.0f : lx;
+        L[1] = (isCrawling || firearmAimNow) ? 0.0f : ly;
+        // Aim handling for RS/LS exposure to the engine
+        if (firearmAimNow) {
+            if (scopedZoom) {
+                // Scoped: fully suppress RS and LS so the game doesn't switch to gamepad-scope behavior
+                R[0] = 0.0f;
+                R[1] = 0.0f;
+                L[0] = 0.0f;
+                L[1] = 0.0f;
+                *g_LS_X = 0.0f; *g_LS_Y = 0.0f;
+            } else {
+                // Non-scoped firearm aim: mouse drives yaw; let RS.y control pitch
+                R[0] = 0.0f;
+                R[1] = ry;
+            }
+        } else {
+            R[0] = isCrawling ? 0.0f : rx;
+            R[1] = ry;
+        }
     }
-    if (fabsf(rx) > 1e-4f || fabsf(ry) > 1e-4f) *g_ImmFlags |= IM_RS_PRESENT; else *g_ImmFlags &= ~IM_RS_PRESENT;
+    if (firearmAimNow) {
+        if (scopedZoom) {
+            *g_ImmFlags &= ~IM_RS_PRESENT;
+        } else {
+            if (fabsf(ry) > 1e-4f) *g_ImmFlags |= IM_RS_PRESENT; else *g_ImmFlags &= ~IM_RS_PRESENT;
+        }
+    }
+    else {
+        if (fabsf(rx) > 1e-4f || fabsf(ry) > 1e-4f) *g_ImmFlags |= IM_RS_PRESENT; else *g_ImmFlags &= ~IM_RS_PRESENT;
+    }
 
     const uint16_t wb = st.Gamepad.wButtons;
     const bool A = (wb & XI_A) != 0;
@@ -588,6 +804,11 @@ static void MH2_UpdateXInputForPlayer(void* playerInst) {
     if (isCrawling) {
         DesireMovementFromStick(lx, ly, desired);
     }
+    
+    // When aiming firearms, use LS for WASD movement instead of analog movement
+    if (firearmAimNow) {
+        DesireMovementFromStick(lx, ly, desired);
+    }
 
     ApplyDesiredKeys(desired);
 }
@@ -610,9 +831,8 @@ static void MH2_MenuTick_DIOnly()
 
 
     // Sticks + DPAD
-    const int   DZ = 7849;
-    const float lx = MH2_NormStick(st.Gamepad.sThumbLX, DZ);
-    const float ly = MH2_NormStick(st.Gamepad.sThumbLY, DZ);
+    const float lx = MH2_NormStick(st.Gamepad.sThumbLX, STICK_DEADZONE_L);
+    const float ly = MH2_NormStick(st.Gamepad.sThumbLY, STICK_DEADZONE_L);
 
     const uint16_t wb = st.Gamepad.wButtons;
     const bool DUp = (wb & XI_DPAD_UP) != 0;
@@ -674,8 +894,6 @@ static void MH2_MenuTick_DIOnly()
 // =====================================================================
 // Camera patch – RS yaw+pitch
 // =====================================================================
-static float CAM_YAW_SENS = 20.0f; // deg/sec scale
-static float CAM_PITCH_SENS = 20.0f;
 
 void* TheCamera = (void*)0x76F240;
 CVector* CurrentCamLookAtOffsetFromPlayer = (CVector*)((char*)TheCamera + 1536);
@@ -731,6 +949,9 @@ CVector* __fastcall GetGlobalCameraPosFromPlayer(void* This, void*,
     const bool firearmAimNoMouse = hasFirearmNow && (rmbHeld || inAimState);
     const bool lbRotateNoGun = rmbHeld && !hasFirearmNow;
     const bool aimCamNow = (firearmAimNoMouse || lbRotateNoGun);
+    
+    // Check if we're scoped - if so, bypass our camera logic entirely
+    const bool isScoped = hasFirearmNow && (*PlrCurrWpnType == WEAPONTYPE_2HFIREARM) && (rmbHeld || inAimState);
 
     // Aim edge handling: commit yaw on enter AND exit to prevent drift
     const bool wasAimingPrev = WasAiming;
@@ -744,16 +965,27 @@ CVector* __fastcall GetGlobalCameraPosFromPlayer(void* This, void*,
         CamYawOffset = 0.0f;
     }
 
-    // RS.x -> yaw offset (used both in aim and freelook)
-    if (fabsf(RSx) > 0.0005f) {
+    // RS.x -> yaw offset (used both in aim and freelook). In scoped mode, use explicit delta.
+    if (isScoped) {
+        if (fabsf(g_ScopedYawDeltaDeg) > 1e-5f) {
+            CamYawOffset = DegWrap(CamYawOffset + g_ScopedYawDeltaDeg);
+            g_ScopedYawDeltaDeg = 0.0f;
+        }
+    } else if (fabsf(RSx) > 0.0005f) {
         CamYawOffset = DegWrap(CamYawOffset + RSx * dt * CAM_YAW_SENS);
         if (CamYawOffset > CAM_FREELOOK_CLAMP) CamYawOffset = CAM_FREELOOK_CLAMP;
         if (CamYawOffset < -CAM_FREELOOK_CLAMP) CamYawOffset = -CAM_FREELOOK_CLAMP;
     }
 
-    // RS.y -> pitch
-    if (fabsf(RSy) > 0.0005f) {
+    // RS.y -> pitch. In scoped mode, use explicit delta and no clamp.
+    if (isScoped) {
+        if (fabsf(g_ScopedPitchDeltaDeg) > 1e-5f) {
+            CamCurrYAngle += g_ScopedPitchDeltaDeg;
+            g_ScopedPitchDeltaDeg = 0.0f;
+        }
+    } else if (fabsf(RSy) > 0.0005f) {
         CamCurrYAngle += RSy * dt * CAM_PITCH_SENS;
+        // Clamp when not scoped
         if (CamCurrYAngle > CamMaxYAngle) CamCurrYAngle = CamMaxYAngle;
         if (CamCurrYAngle < CamMinYAngle) CamCurrYAngle = CamMinYAngle;
     }
@@ -762,7 +994,7 @@ CVector* __fastcall GetGlobalCameraPosFromPlayer(void* This, void*,
     CVector2d* LS = (CVector2d*)((char*)This + 1168);
     float moveMag = (LS) ? sqrtf(LS->x * LS->x + LS->y * LS->y) : 0.0f;
     if (!aimCamNow && moveMag > 0.15f && fabsf(RSx) < 0.05f && fabsf(CamYawOffset) > 1e-3f) {
-        const float CAM_RECENTER_SPEED = 240.0f; // deg/sec
+        const float CAM_RECENTER_SPEED = 70.0f; // deg/sec
         float step = CAM_RECENTER_SPEED * dt;
         if (fabsf(CamYawOffset) <= step) CamYawOffset = 0.0f;
         else CamYawOffset += (CamYawOffset > 0.0f ? -step : step);
@@ -1066,10 +1298,27 @@ static void InstallPauseMenuHook() {
 
 extern "C" void MH2_XInputGlue_Install() {
     MH2_InitXInput();
+
+    if (!g_ModEnabled) {
+        MH2_Log(L"[XInput] EnableMod=0 — not installing hooks.");
+        return;
+    }
+
+    if (g_BlockOnConflict && HasConflictingASI()) {
+        MH2_Log(L"[XInput] Conflicting ASI detected (AbsoluteCamera or MH2Patch) — not installing hooks.");
+        return;
+    }
+    Memory::VP::InjectHook(0x513DEA, InterpolateAimAngle);
+    Memory::VP::InjectHook(0x5B0510, GetGlobalCameraPosFromPlayer);
+    Memory::VP::InjectHook(0x5455E6, ProcessCrosshair);
+    Memory::VP::InjectHook(0x414650, MH2_XInputEnableShim, PATCH_JUMP);
     Memory::VP::InjectHook(0x004B0110, TranslateKeytoAction_Hook, PATCH_JUMP);
-    InstallPauseMenuHook();     // <-- important
+    InstallPauseMenuHook();
     InstallFEConfirmHook();
+
+    MH2_Log(L"[XInput] Hooks installed.");
 }
+
 
 
 #endif // MH2_XINPUT_GLUE_H
