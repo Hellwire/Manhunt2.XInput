@@ -16,7 +16,6 @@
 #include "CInput.h"
 #include "keyboard.h"
 
-
 // =========================
 // XInput shims / structures
 // =========================
@@ -63,16 +62,26 @@ static volatile float* const g_RS_Y = (float*)0x0076BE88;
 static volatile uint32_t* const g_PadFlags = (uint32_t*)0x0076BE8C;
 static volatile uint32_t* const g_ImmFlags = (uint32_t*)0x0076BE6C;
 
-static volatile float* const g_StruggleX = (float*)0x0076BE64;
-static volatile float* const g_StruggleY = (float*)0x0076BE68;
-
 static const uint32_t IM_RS_PRESENT = 0x400;  // case 0x0F
-// Sniper/scoped zoom state flag used by the camera logic
-static volatile bool* const g_SniperZoom = (bool*)0x0075B348;
 
+
+// --- BEGIN PATCH: Scoped globals & knobs (weapon-type based) ---
 // Scoped aim deltas (degrees per frame), produced in input update and consumed in camera
 static float g_ScopedYawDeltaDeg = 0.0f;
 static float g_ScopedPitchDeltaDeg = 0.0f;
+
+// Configurable clamp for aim; already loaded from INI
+static float AIM_PITCH_MIN = -29.0f;
+static float AIM_PITCH_MAX = 42.0f;
+
+// New: edge/state helpers for scoped entry/exit and a one-frame delta mute
+static bool  g_WasScopedZoom = false;
+static int   g_MuteScopedMouseFrames = 0; // when >0, skip emitting OS mouse dx/dy this frame
+
+// Optional: small bias to apply once on scoped entry (deg). 0 by default.
+static float g_ScopedPitchBiasDeg = 0.0f;
+// --- END PATCH: Scoped globals & knobs ---
+
 
 // ===== triplet table scanned by the keyboard provider =====
 static volatile int* const gTripBase = (int*)0x0076BEA0; // [code, pressed, extra] x N
@@ -93,6 +102,7 @@ static bool g_BlockOnConflict = true;       // [General] BlockIfConflicts
 static bool g_LogToConsole = true;          // [General] LogToConsole
 // -1 = ignore (do nothing), 0 = force cursor HIDDEN when pad connected, 1 = force VISIBLE when pad connected
 static int  g_MouseCursorWithGamepad = -1;  // [General] MouseCursorWithGamepad
+
 
 // === NEW: console logging ===
 static bool g_ConsoleReady = false;
@@ -158,8 +168,17 @@ static float s_AimMouseYAcc = 0.0f;
 // Camera sensitivity constants (configurable via INI)
 static float CAM_YAW_SENS = 20.0f; // deg/sec scale
 static float CAM_PITCH_SENS = 20.0f;
-static float AIM_MOUSE_X_SENS_CONFIG = 2000.0f; // pixels/sec at full RS deflection
-static float AIM_MOUSE_Y_SENS_CONFIG = 2000.0f;
+static float AIM_MOUSE_X_SENS_CONFIG = 1500.0f; // pixels/sec at full RS deflection
+static float AIM_MOUSE_Y_SENS_CONFIG = 1000.0f;
+
+// ==== QTM (stealth minigame) detection & control ====
+static bool  g_QtmActive = false;   // live flag
+static bool  g_QtmWasActive = false;   // edge tracking
+static int   g_QtmSeenFrames = 0;       // countdown refreshed by "QTMGO" lookups
+static float QTM_MOUSE_X_SENS = 1800.0f; // pixels/sec at full RS deflection
+static float QTM_MOUSE_Y_SENS = 1800.0f;
+static float s_QtmMouseXAcc = 0.0f;    // subpixel accumulators
+static float s_QtmMouseYAcc = 0.0f;
 
 
 static volatile int* const gTripPressedBase = (int*)0x0076BEA4;
@@ -179,6 +198,21 @@ static void GetDllFolder(wchar_t* outPath, size_t size) {
     if (slash) *(slash + 1) = L'\0'; else wcscpy_s(outPath, size, L".\\");
 }
 
+static inline void WriteJump(void* at, void* to) {
+    DWORD old; VirtualProtect(at, 5, PAGE_EXECUTE_READWRITE, &old);
+    uintptr_t rel = (uintptr_t)to - ((uintptr_t)at + 5);
+    uint8_t jmp[5] = { 0xE9, (uint8_t)rel, (uint8_t)(rel >> 8), (uint8_t)(rel >> 16), (uint8_t)(rel >> 24) };
+    memcpy(at, jmp, 5);
+    VirtualProtect(at, 5, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), at, 5);
+}
+static inline void WriteBytes(void* at, const uint8_t* bytes, size_t n) {
+    DWORD old; VirtualProtect(at, n, PAGE_EXECUTE_READWRITE, &old);
+    memcpy(at, bytes, n);
+    VirtualProtect(at, n, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), at, n);
+}
+
 static void MH2_LoadConfig()
 {
     if (!g_IniPath[0]) {
@@ -196,19 +230,30 @@ static void MH2_LoadConfig()
         // General defaults
         WritePrivateProfileStringW(L"General", L"EnableMod", L"1", g_IniPath);
         WritePrivateProfileStringW(L"General", L"BlockIfConflicts", L"1", g_IniPath);
-        WritePrivateProfileStringW(L"General", L"LogToConsole", L"1", g_IniPath);
+        WritePrivateProfileStringW(L"General", L"LogToConsole", L"0", g_IniPath);
         // -1 ignore, 0 = hide cursor on pad connect, 1 = show cursor on pad connect
-        WritePrivateProfileStringW(L"General", L"MouseCursorWithGamepad", L"-1", g_IniPath);
+        WritePrivateProfileStringW(L"General", L"MouseCursorWithGamepad", L"0", g_IniPath);
 
         // Existing camera defaults
-        WritePrivateProfileStringW(L"Camera", L"InvertLookX", L"0", g_IniPath);
-        WritePrivateProfileStringW(L"Camera", L"InvertLookY", L"0", g_IniPath);
+        WritePrivateProfileStringW(L"Camera", L"InvertLookX", L"1", g_IniPath);
+        WritePrivateProfileStringW(L"Camera", L"InvertLookY", L"1", g_IniPath);
         
         // Sensitivity defaults
         WritePrivateProfileStringW(L"Camera", L"YawSensitivity", L"20.0", g_IniPath);
         WritePrivateProfileStringW(L"Camera", L"PitchSensitivity", L"20.0", g_IniPath);
-        WritePrivateProfileStringW(L"Aim", L"MouseXSensitivity", L"2000.0", g_IniPath);
-        WritePrivateProfileStringW(L"Aim", L"MouseYSensitivity", L"2000.0", g_IniPath);
+        WritePrivateProfileStringW(L"Aim", L"MouseXSensitivity", L"400.0", g_IniPath);
+        WritePrivateProfileStringW(L"Aim", L"MouseYSensitivity", L"800.0", g_IniPath);
+
+        // Aim pitch clamp defaults
+        WritePrivateProfileStringW(L"Aim", L"PitchMinDeg", L"-29.0", g_IniPath);
+        WritePrivateProfileStringW(L"Aim", L"PitchMaxDeg", L"82.0", g_IniPath);
+        WritePrivateProfileStringW(L"Aim", L"ScopedPitchBiasDeg", L"0.0", g_IniPath);
+
+        // in the "create ini with defaults" block:
+        WritePrivateProfileStringW(L"QTM", L"MouseXSensitivity", L"100.0", g_IniPath);
+        WritePrivateProfileStringW(L"QTM", L"MouseYSensitivity", L"100.0", g_IniPath);
+
+
     }
 
     // Read values
@@ -226,10 +271,22 @@ static void MH2_LoadConfig()
     CAM_YAW_SENS = (float)_wtof(sensBuf);
     GetPrivateProfileStringW(L"Camera", L"PitchSensitivity", L"20.0", sensBuf, 32, g_IniPath);
     CAM_PITCH_SENS = (float)_wtof(sensBuf);
-    GetPrivateProfileStringW(L"Aim", L"MouseXSensitivity", L"2000.0", sensBuf, 32, g_IniPath);
+    GetPrivateProfileStringW(L"Aim", L"MouseXSensitivity", L"400.0", sensBuf, 32, g_IniPath);
     AIM_MOUSE_X_SENS_CONFIG = (float)_wtof(sensBuf);
-    GetPrivateProfileStringW(L"Aim", L"MouseYSensitivity", L"2000.0", sensBuf, 32, g_IniPath);
+    GetPrivateProfileStringW(L"Aim", L"MouseYSensitivity", L"800.0", sensBuf, 32, g_IniPath);
     AIM_MOUSE_Y_SENS_CONFIG = (float)_wtof(sensBuf);
+    GetPrivateProfileStringW(L"Aim", L"PitchMinDeg", L"-29.0", sensBuf, 32, g_IniPath);
+    AIM_PITCH_MIN = (float)_wtof(sensBuf);
+    GetPrivateProfileStringW(L"Aim", L"PitchMaxDeg", L"82.0", sensBuf, 32, g_IniPath);
+    AIM_PITCH_MAX = (float)_wtof(sensBuf);
+    GetPrivateProfileStringW(L"Aim", L"ScopedPitchBiasDeg", L"0.0", sensBuf, 32, g_IniPath);
+    g_ScopedPitchBiasDeg = (float)_wtof(sensBuf);
+    GetPrivateProfileStringW(L"QTM", L"MouseXSensitivity", L"100.0", sensBuf, 32, g_IniPath);
+    QTM_MOUSE_X_SENS = (float)_wtof(sensBuf);
+    GetPrivateProfileStringW(L"QTM", L"MouseYSensitivity", L"100.0", sensBuf, 32, g_IniPath);
+    QTM_MOUSE_Y_SENS = (float)_wtof(sensBuf);
+
+
 }
 
 static bool HasConflictingASI() {
@@ -445,9 +502,11 @@ static inline void EmitSystemMouseMoveDelta(int dx, int dy) {
 
 // === NEW: state taps for robust menu detection ===
 static volatile uint32_t* const g_GameState = (uint32_t*)0x006EC990; // main state machine
-static volatile uint8_t* const g_GameplayEnabled = (uint8_t*)0x00696EF0; // SetGameplayInputEnabled flag
 static volatile uint8_t* const g_MenuMgr = (uint8_t*)0x0075F110; // FUN_00562df0 result
 static volatile uintptr_t* const g_BinkHandle = (uintptr_t*)0x0079E708; // nonzero if .bik is playing
+static volatile float* const g_MouseDX = (float*)0x0076BE74;
+static volatile float* const g_MouseDY = (float*)0x0076BE78;
+
 
 static inline bool IsMenuActive() {
     const uint32_t st = *g_GameState;
@@ -460,17 +519,169 @@ static inline bool IsMenuActive() {
 // Remember last mode so we can release keys when switching
 static bool sWasInMenu = false;
 
-// Small helper: LS → digital with hysteresis (for menu repeat that feels nice)
-static inline bool StickPos(bool positive, float v, float on = 0.55f, float off = 0.35f)
+// ===== QTM HUD "is active" detour (no strings) =========================
+static const uintptr_t ADDR_QTM_HUD = 0x00596FB0; // verify in your build
+
+static uint8_t  g_QtmHud_OrigBytes[8] = { 0 };
+static size_t   g_QtmHud_StolenLen = 0;
+static uint8_t* g_QtmHud_Gateway = nullptr;
+static bool     g_QtmHudHookInstalled = false;
+
+static void __stdcall OnQtmHud(void* hudThis)
 {
-    static float accP = 0.f, accN = 0.f;
-    float& acc = positive ? accP : accN;
-    const float val = positive ? v : -v;
-    if (val >= on) { acc = 1.f; return true; }
-    if (val <= off) acc = 0.f;
-    return acc > 0.5f;
+    // QTM HUD alpha gate (alpha > 0 => QTM visible this frame)
+    const float alpha = *(float*)((uint8_t*)hudThis + 0x30);
+
+    // Keep a heartbeat for the gameplay side (even if it lags)
+    if (alpha > 0.0f) g_QtmSeenFrames = 6;
+
+    // --- Robust dt (don’t rely on engine dt while HUD is drawing) ---
+    static LARGE_INTEGER s_freq = {};
+    static LARGE_INTEGER s_prev = {};
+    if (!s_freq.QuadPart) {
+        QueryPerformanceFrequency(&s_freq);
+        QueryPerformanceCounter(&s_prev);
+    }
+    LARGE_INTEGER now; QueryPerformanceCounter(&now);
+    double dt = double(now.QuadPart - s_prev.QuadPart) / double(s_freq.QuadPart);
+    s_prev = now;
+    // Clamp dt to sane range so pauses/spikes don’t explode movement
+    if (dt < 1.0 / 240.0) dt = 1.0 / 240.0;
+    if (dt > 1.0 / 20.0)  dt = 1.0 / 20.0;
+
+    // One-time HUD show/hide logs
+    static bool s_hudShown = false;
+    if (alpha > 0.0f) {
+        if (!s_hudShown) {
+            MH2_Log(L"[QTM] DEBUGINFO: HUD visible (alpha=%.3f)", alpha);
+            s_hudShown = true;
+        }
+    }
+
+    // If not visible this frame, nothing to drive.
+    if (!(alpha > 0.0f) || !g_XIGetState) return;
+
+    // Read pad
+    MH2_XINPUT_STATE st{};
+    if (g_XIGetState(0, &st) != ERROR_SUCCESS) return;
+
+    // Normalize RS (same DZ as gameplay)
+    auto Norm = [](int16_t v, int dz) -> float {
+        int iv = (int)v;
+        if (iv >= -dz && iv <= dz) return 0.0f;
+        const int max = 32767;
+        float sign = (iv < 0) ? -1.0f : 1.0f;
+        float mag = (float)(abs(iv) - dz) / (float)(max - dz);
+        if (mag < 0.0f) mag = 0.0f; if (mag > 1.0f) mag = 1.0f;
+        return sign * mag;
+        };
+    const int DZ_R = 8689;
+    const float rx = Norm(st.Gamepad.sThumbRX, DZ_R);
+    const float ry = Norm(st.Gamepad.sThumbRY, DZ_R);
+
+    // Use QTM sens + invert, independent of engine dt
+    static float accX = 0.0f, accY = 0.0f;
+    const float dxF = rx * (float)dt * QTM_MOUSE_X_SENS * (g_InvertLookX ? 1.0f : -1.0f);
+    const float dyF = -ry * (float)dt * QTM_MOUSE_Y_SENS * (g_InvertLookY ? 1.0f : -1.0f);
+
+    accX += dxF;
+    accY += dyF;
+
+    const int dx = (int)((accX >= 0.0f) ? (accX + 0.5f) : (accX - 0.5f));
+    const int dy = (int)((accY >= 0.0f) ? (accY + 0.5f) : (accY - 0.5f));
+
+    if (dx | dy) {
+        // 1) Feed the game’s internal mouse-delta slots
+        *g_MouseDX += (float)dx;
+        *g_MouseDY += (float)dy;
+
+        // 2) ALSO emit OS relative mouse movement (some QTM paths read OS input)
+        INPUT in{}; in.type = INPUT_MOUSE;
+        in.mi.dwFlags = MOUSEEVENTF_MOVE;
+        in.mi.dx = dx; in.mi.dy = dy;
+        SendInput(1, &in, sizeof(in));
+
+        accX -= (float)dx;
+        accY -= (float)dy;
+    }
 }
 
+
+
+static void __declspec(naked) QtmHud_Hook()
+{
+    __asm {
+        // Preserve state
+        pushad
+        pushfd
+
+        mov     eax, ecx     // __thiscall 'this'
+        push    eax
+        call    OnQtmHud
+
+        popfd
+        popad
+
+        jmp     g_QtmHud_Gateway
+    }
+}
+
+static void InstallQtmHudHook()
+{
+    if (g_QtmHudHookInstalled) return;
+
+    // Heuristic: detect common prologue
+    const uint8_t* p = (const uint8_t*)ADDR_QTM_HUD;
+    size_t steal = 5; // minimum for JMP
+
+    // Typical: 55 8B EC 83 EC imm8   -> 6 bytes
+    if (p[0] == 0x55 && p[1] == 0x8B && p[2] == 0xEC) {
+        if (p[3] == 0x83 && p[4] == 0xEC) {
+            steal = 6; // take full SUB too so we don't split it
+        }
+        else {
+            steal = 5; // PUSH/MOV only; safe to take 5
+        }
+    }
+
+    g_QtmHud_StolenLen = steal;
+    memcpy(g_QtmHud_OrigBytes, (void*)ADDR_QTM_HUD, g_QtmHud_StolenLen);
+
+    // Gateway = [orig bytes][jmp back]
+    g_QtmHud_Gateway = (uint8_t*)VirtualAlloc(nullptr, g_QtmHud_StolenLen + 5,
+        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    memcpy(g_QtmHud_Gateway, g_QtmHud_OrigBytes, g_QtmHud_StolenLen);
+
+    // jmp from gateway -> (ADDR + stolenLen)
+    {
+        const uintptr_t srcNext = (uintptr_t)(g_QtmHud_Gateway + g_QtmHud_StolenLen + 5);
+        const uintptr_t dst = (ADDR_QTM_HUD + g_QtmHud_StolenLen);
+        const int32_t   rel = (int32_t)(dst - srcNext);
+        g_QtmHud_Gateway[g_QtmHud_StolenLen] = 0xE9;
+        *(int32_t*)(g_QtmHud_Gateway + g_QtmHud_StolenLen + 1) = rel;
+    }
+
+    // Patch target with JMP hook (over exactly stolenLen bytes)
+    DWORD oldProt;
+    VirtualProtect((void*)ADDR_QTM_HUD, g_QtmHud_StolenLen, PAGE_EXECUTE_READWRITE, &oldProt);
+    {
+        // Fill with NOPs first (helps if stolenLen > 5)
+        for (size_t i = 0; i < g_QtmHud_StolenLen; ++i) ((uint8_t*)ADDR_QTM_HUD)[i] = 0x90;
+
+        const uintptr_t srcNext = ADDR_QTM_HUD + 5;
+        const uintptr_t dst = (uintptr_t)&QtmHud_Hook;
+        const int32_t   rel = (int32_t)(dst - srcNext);
+
+        ((uint8_t*)ADDR_QTM_HUD)[0] = 0xE9;
+        *(int32_t*)((uint8_t*)ADDR_QTM_HUD + 1) = rel;
+    }
+    VirtualProtect((void*)ADDR_QTM_HUD, g_QtmHud_StolenLen, oldProt, &oldProt);
+    FlushInstructionCache(GetCurrentProcess(), (void*)ADDR_QTM_HUD, g_QtmHud_StolenLen);
+
+    g_QtmHudHookInstalled = true;
+    MH2_Log(L"[QTM] HUD hook installed @ 0x%08X (stole %u bytes)",
+        (uint32_t)ADDR_QTM_HUD, (unsigned)g_QtmHud_StolenLen);
+}
 
 
 static uint8_t sTripHold[256] = {};   // frames left to hold per DIK
@@ -605,7 +816,75 @@ static void MH2_UpdateXInputForPlayer(void* playerInst) {
                 (g_MouseCursorWithGamepad == 1) ? L"VISIBLE" : L"HIDDEN");
         }
     }
+    // --- sticks (LS/RS) ---
+    float lx = MH2_NormStick(st.Gamepad.sThumbLX, STICK_DEADZONE_L);
+    float ly = MH2_NormStick(st.Gamepad.sThumbLY, STICK_DEADZONE_L);
+    float rx = MH2_NormStick(st.Gamepad.sThumbRX, STICK_DEADZONE_R);
+    float ry = MH2_NormStick(st.Gamepad.sThumbRY, STICK_DEADZONE_R);
 
+    // ===== QTM: heartbeat → active flag (do this BEFORE menus) =====
+    if (g_QtmSeenFrames > 0) --g_QtmSeenFrames;
+    const bool qtmNow = (g_QtmSeenFrames > 0);
+
+    if (qtmNow != g_QtmWasActive) {
+        if (qtmNow) {
+            MH2_Log(L"[QTM] Exit");
+            // clean edges: no sticky keys/buttons and clear accumulators
+            ReleaseAllTrackedKeys();
+            EmitSystemLMB(false);
+            EmitSystemRMB(false);
+            s_QtmMouseXAcc = s_QtmMouseYAcc = 0.0f;
+        }
+    }
+    g_QtmActive = qtmNow;
+
+    // ===== QTM: take over input while active (feed game mouse deltas, not OS) =====
+    if (g_QtmActive) {
+        const float dt = *(float*)0x6ECE68;
+        const float dxF = rx * dt * QTM_MOUSE_X_SENS * (g_InvertLookX ? -1.0f : 1.0f);
+        const float dyF = ry * dt * QTM_MOUSE_Y_SENS * (g_InvertLookY ? -1.0f : 1.0f);
+
+        s_QtmMouseXAcc += dxF;
+        s_QtmMouseYAcc += dyF;
+
+        const int dx = RoundToInt(s_QtmMouseXAcc);
+        const int dy = RoundToInt(s_QtmMouseYAcc);
+        if (dx || dy) {
+            *g_MouseDX += (float)dx;   // write into the game’s mouse-delta accumulators
+            *g_MouseDY += (float)dy;
+
+            // keep the desktop cursor still during QTM (uncomment to move OS cursor too)
+            // EmitSystemMouseMoveDelta(dx, dy);
+
+            s_QtmMouseXAcc -= (float)dx;
+            s_QtmMouseYAcc -= (float)dy;
+            // Optional debug:
+            // MH2_Log(L"[QTM] dt=%.4f rx=%.3f ry=%.3f -> dx=%d dy=%d", dt, rx, ry, dx, dy);
+        }
+
+        // Silence everything else so the minigame has clean mouse-only input
+        EmitSystemLMB(false);
+        EmitSystemRMB(false);
+
+        // Zero analogs to the engine/player
+        if (playerInst) {
+            float* L = (float*)((char*)playerInst + 1168);
+            float* R = (float*)((char*)playerInst + 1184);
+            L[0] = L[1] = R[0] = R[1] = 0.0f;
+        }
+        *g_LS_X = *g_LS_Y = *g_RS_X = *g_RS_Y = 0.0f;
+        *g_PadFlags = 0;
+        *g_ImmFlags &= ~(IM_RS_PRESENT);
+
+        // No keyboard mapping while QTM is up
+        bool noKeys[256] = { false };
+        ApplyDesiredKeys(noKeys);
+
+        // We handled this frame entirely; skip the rest of the glue.
+        return;
+    }
+
+    // ===== Menus (only reached when NOT in QTM) =====
     const bool inMenu = IsMenuActive();
     if (inMenu) {
         if (!sWasInMenu) {
@@ -615,7 +894,7 @@ static void MH2_UpdateXInputForPlayer(void* playerInst) {
             EmitSystemRMB(false);
             s_CrawlMouseXAcc = 0.0f;
             g_DDArmed = true;
-            ResetMenuGates(); // <— make sure A/X/DPAD edges re-arm when entering menus
+            ResetMenuGates(); // re-arm A/X/DPAD edges
             sWasInMenu = true;
         }
         // keep engine analogs quiescent while in menu
@@ -626,12 +905,6 @@ static void MH2_UpdateXInputForPlayer(void* playerInst) {
     }
     if (sWasInMenu) { ReleaseAllTrackedKeys(); sWasInMenu = false; }
 
-
-    // --- sticks (LS/RS) ---
-    float lx = MH2_NormStick(st.Gamepad.sThumbLX, STICK_DEADZONE_L);
-    float ly = MH2_NormStick(st.Gamepad.sThumbLY, STICK_DEADZONE_L);
-    float rx = MH2_NormStick(st.Gamepad.sThumbRX, STICK_DEADZONE_R);
-    float ry = MH2_NormStick(st.Gamepad.sThumbRY, STICK_DEADZONE_R);
 
     // crawl state (affects movement input path)
     bool isCrawling = false;
@@ -654,64 +927,96 @@ static void MH2_UpdateXInputForPlayer(void* playerInst) {
         s_CrawlMouseXAcc = 0.0f;
     }
 
-    // Detect firearm aim (sniper and other scoped modes)
+    // --- BEGIN PATCH: Aim detection (weapon-type), scoped edge handling, and delta mute ---
+        // Detect firearm aim (sniper and other scoped modes)
     bool firearmAimNow = false;
     bool scopedZoom = false;
+
+    float* PlrCurrYAngle = nullptr;
+    int* PlrCurrState = nullptr;
+    int* PlrCurrWpnType = nullptr;
+    int* PlrLockOnHunter = nullptr;
+    bool* PlrActionLockOn = nullptr;
+
     if (playerInst) {
         const bool rmbHeld = g_SysRMBDown;
-        int* PlrCurrState = (int*)((char*)playerInst + 956);
-        int* PlrCurrWpnType = (int*)((char*)playerInst + 968);
-        int* PlrLockOnHunter = (int*)((char*)playerInst + 4500);
-        bool* PlrActionLockOn = (bool*)((char*)playerInst + 1352);
+
+        PlrCurrState = (int*)((char*)playerInst + 956);
+        PlrCurrWpnType = (int*)((char*)playerInst + 968);
+        PlrLockOnHunter = (int*)((char*)playerInst + 4500);
+        PlrActionLockOn = (bool*)((char*)playerInst + 1352);
+        PlrCurrYAngle = (float*)((char*)playerInst + 4400);
+
         const bool inAimState = (PlrCurrState && (*PlrCurrState == PEDSTATE_AIM || *PlrCurrState == PEDSTATE_CROUCHAIM)) ||
             (PlrLockOnHunter && *PlrLockOnHunter && PlrActionLockOn && *PlrActionLockOn);
+
         const bool hasFirearmNow = (PlrCurrWpnType) ? HasFirearm(*PlrCurrWpnType) : false;
         firearmAimNow = hasFirearmNow && (rmbHeld || inAimState);
-        
-        // Detect scoped weapons (sniper rifles) by weapon type
-        if (firearmAimNow && PlrCurrWpnType) {
-            // Assume sniper rifles are 2H firearms - adjust if needed
-            scopedZoom = (*PlrCurrWpnType == WEAPONTYPE_2HFIREARM);
-            static bool lastScopedState = false;
-            if (scopedZoom && !lastScopedState) {
-                MH2_Log(L"[XInput] Scoped weapon detected - using mouse-only aim");
-                lastScopedState = true;
-            } else if (!scopedZoom && lastScopedState) {
-                MH2_Log(L"[XInput] Scoped weapon ended - returning to normal aim");
-                lastScopedState = false;
-            }
+
+        // Scoped when weapon is 2H firearm *and* we are aiming (RMB or aim state)
+        scopedZoom = firearmAimNow && PlrCurrWpnType && (*PlrCurrWpnType == WEAPONTYPE_2HFIREARM);
+
+        // Input-path scoped edge: only mute mouse deltas on the very first frame
+        static bool sLastScopedInput = false;
+        if (!sLastScopedInput && scopedZoom) {
+            // First frame of scope: mute OS mouse delta once to avoid a dip
+            g_MuteScopedMouseFrames = 1;
+            s_AimMouseXAcc = 0.0f;
+            s_AimMouseYAcc = 0.0f;
+            MH2_Log(L"[XInput] Scoped entry (input) -> mute deltas 1f");
         }
+        else if (sLastScopedInput && !scopedZoom) {
+            MH2_Log(L"[XInput] Scoped exit (input)");
+        }
+        sLastScopedInput = scopedZoom;
+        g_WasScopedZoom = scopedZoom;
     }
 
     if (firearmAimNow) {
         const float dt = *(float*)0x6ECE68;
+
         // Always drive yaw by mouse X while aiming (apply invert settings - flipped to match normal camera)
         const float dxF = rx * dt * AIM_MOUSE_X_SENS_CONFIG * (g_InvertLookX ? 1.0f : -1.0f);
         s_AimMouseXAcc += dxF;
         int dx = RoundToInt(s_AimMouseXAcc);
         int dy = 0;
+
         if (scopedZoom) {
-            // In scoped/sniper, also drive pitch via mouse Y and suppress pad axes later
+            // In scoped/sniper, also drive pitch via mouse Y (the engine is in "mouse-only scope")
             const float dyF = -ry * dt * AIM_MOUSE_Y_SENS_CONFIG * (g_InvertLookY ? 1.0f : -1.0f); // RS up -> mouse up
             s_AimMouseYAcc += dyF;
             dy = RoundToInt(s_AimMouseYAcc);
-            // Produce explicit camera deltas in degrees for scoped mode (apply invert settings - flipped to match normal camera)
+
+            // Optional: track deltas in degrees (not consumed here, just informational)
             g_ScopedYawDeltaDeg += rx * dt * CAM_YAW_SENS * (g_InvertLookX ? 1.0f : -1.0f);
             g_ScopedPitchDeltaDeg += ry * dt * CAM_PITCH_SENS * (g_InvertLookY ? 1.0f : -1.0f);
-        } else {
+        }
+        else {
             // Non-scoped firearm aim: leave pitch to RS.y (avoid double input)
             s_AimMouseYAcc = 0.0f;
         }
-        if (dx != 0 || dy != 0) {
-            EmitSystemMouseMoveDelta(dx, dy);
+
+        // Emit OS mouse deltas unless we’re intentionally muting on the very first scoped frame
+        if (!(scopedZoom && g_MuteScopedMouseFrames > 0)) {
+            if (dx != 0 || dy != 0) {
+                EmitSystemMouseMoveDelta(dx, dy);
+                s_AimMouseXAcc -= (float)dx;
+                if (dy != 0) s_AimMouseYAcc -= (float)dy;
+            }
+        }
+        else {
+            // Consume/clear for the muted frame
             s_AimMouseXAcc -= (float)dx;
-            if (dy != 0) s_AimMouseYAcc -= (float)dy;
+            s_AimMouseYAcc -= (float)dy;
         }
     }
     else {
         s_AimMouseXAcc = 0.0f;
         s_AimMouseYAcc = 0.0f;
     }
+
+    // Clear the one-frame mute after we processed this frame
+    if (g_MuteScopedMouseFrames > 0) --g_MuteScopedMouseFrames;
 
     *g_LS_X = (isCrawling || firearmAimNow) ? 0.0f : lx;
     *g_LS_Y = (isCrawling || firearmAimNow) ? 0.0f : ly;
@@ -731,35 +1036,43 @@ static void MH2_UpdateXInputForPlayer(void* playerInst) {
         float* R = (float*)((char*)playerInst + 1184);
         L[0] = (isCrawling || firearmAimNow) ? 0.0f : lx;
         L[1] = (isCrawling || firearmAimNow) ? 0.0f : ly;
-        // Aim handling for RS/LS exposure to the engine
+
         if (firearmAimNow) {
             if (scopedZoom) {
-                // Scoped: fully suppress RS and LS so the game doesn't switch to gamepad-scope behavior
-                R[0] = 0.0f;
-                R[1] = 0.0f;
-                L[0] = 0.0f;
-                L[1] = 0.0f;
+                // Scoped/sniper: let native mouse-only scope handle aiming.
+                // Suppress BOTH sticks so the engine does not switch to pad-scope behavior.
+                R[0] = 0.0f; R[1] = 0.0f;
+                L[0] = 0.0f; L[1] = 0.0f;
                 *g_LS_X = 0.0f; *g_LS_Y = 0.0f;
-            } else {
-                // Non-scoped firearm aim: mouse drives yaw; let RS.y control pitch
+
+                // Make sure our explicit deltas are not used anywhere.
+                g_ScopedYawDeltaDeg = 0.0f;
+                g_ScopedPitchDeltaDeg = 0.0f;
+            }
+            else {
+                // Non-scoped firearm aim: mouse drives yaw; keep RS.y for pitch
                 R[0] = 0.0f;
                 R[1] = ry;
             }
-        } else {
+        }
+        else {
             R[0] = isCrawling ? 0.0f : rx;
             R[1] = ry;
         }
     }
+
     if (firearmAimNow) {
         if (scopedZoom) {
             *g_ImmFlags &= ~IM_RS_PRESENT;
-        } else {
+        }
+        else {
             if (fabsf(ry) > 1e-4f) *g_ImmFlags |= IM_RS_PRESENT; else *g_ImmFlags &= ~IM_RS_PRESENT;
         }
     }
     else {
         if (fabsf(rx) > 1e-4f || fabsf(ry) > 1e-4f) *g_ImmFlags |= IM_RS_PRESENT; else *g_ImmFlags &= ~IM_RS_PRESENT;
     }
+    // --- END PATCH: Aim detection (weapon-type), scoped edge handling, and delta mute ---
 
     const uint16_t wb = st.Gamepad.wButtons;
     const bool A = (wb & XI_A) != 0;
@@ -907,6 +1220,7 @@ static float CAM_FREELOOK_CLAMP = 120.0f;
 static float CamYawOffset = 0.0f;
 static bool  WasAiming = false;
 
+
 static inline float Deg2Rad(float x) { return x * (3.14159265358979323846f / 180.0f); }
 static inline float DegWrap(float a) {
     while (a > 180.0f) a -= 360.0f;
@@ -950,55 +1264,84 @@ CVector* __fastcall GetGlobalCameraPosFromPlayer(void* This, void*,
     const bool lbRotateNoGun = rmbHeld && !hasFirearmNow;
     const bool aimCamNow = (firearmAimNoMouse || lbRotateNoGun);
     
-    // Check if we're scoped - if so, bypass our camera logic entirely
-    const bool isScoped = hasFirearmNow && (*PlrCurrWpnType == WEAPONTYPE_2HFIREARM) && (rmbHeld || inAimState);
+    // --- BEGIN PATCH: Camera uses weapon-type scoped detection with edge handling ---
+     // Check if we're scoped - 2H firearm while actively aiming
+    const bool isScoped =
+        hasFirearmNow &&
+        (*PlrCurrWpnType == WEAPONTYPE_2HFIREARM) &&
+        (rmbHeld || inAimState);
 
-    // Aim edge handling: commit yaw on enter AND exit to prevent drift
+    // Track generic aim state (freelook / ADS) separately from scope
     const bool wasAimingPrev = WasAiming;
     WasAiming = aimCamNow;
-    if (aimCamNow && !wasAimingPrev) {
+
+    // Scoped rising/falling edge handled ONLY here (camera side)
+    static bool sWasScopedCam = false;
+    if (!sWasScopedCam && isScoped) {
+        // Entering scope: commit freelook yaw into engine once, zero yaw offset,
+        // then initialize engine aim pitch from our freelook pitch + optional bias.
         *PlrCurrYAngle = DegWrap(*PlrCurrYAngle + CamYawOffset);
         CamYawOffset = 0.0f;
+
+        *PlrCurrYAngle = CamCurrYAngle + g_ScopedPitchBiasDeg;
+        MH2_Log(L"[Cam] Scoped entry -> yaw committed, pitch baseline=%.2f (bias=%.2f)", CamCurrYAngle, g_ScopedPitchBiasDeg);
     }
-    else if (!aimCamNow && wasAimingPrev) {
-        *PlrCurrYAngle = DegWrap(*PlrCurrYAngle + CamYawOffset);
+    else if (sWasScopedCam && !isScoped) {
+        // Exiting scope: bring engine aim pitch back to freelook
+        CamCurrYAngle = *PlrCurrYAngle;
+        MH2_Log(L"[Cam] Scoped exit -> freelook pitch=%.2f", CamCurrYAngle);
+    }
+    sWasScopedCam = isScoped;
+
+    if (isScoped) {
+        // While scoped, engine mouse handling owns the camera.
         CamYawOffset = 0.0f;
-    }
+        CamCurrYAngle = *PlrCurrYAngle;
 
-    // RS.x -> yaw offset (used both in aim and freelook). In scoped mode, use explicit delta.
-    if (isScoped) {
-        if (fabsf(g_ScopedYawDeltaDeg) > 1e-5f) {
-            CamYawOffset = DegWrap(CamYawOffset + g_ScopedYawDeltaDeg);
-            g_ScopedYawDeltaDeg = 0.0f;
+        // (Keep deltas clear — not used while scoped.)
+        g_ScopedYawDeltaDeg = 0.0f;
+        g_ScopedPitchDeltaDeg = 0.0f;
+    }
+    else {
+        // IMPORTANT: do not run the generic aim yaw-commit on scope enter/exit.
+        // Only commit on non-scoped aim enter/exit:
+        if (aimCamNow && !wasAimingPrev) {
+            *PlrCurrYAngle = DegWrap(*PlrCurrYAngle + CamYawOffset);
+            CamYawOffset = 0.0f;
         }
-    } else if (fabsf(RSx) > 0.0005f) {
-        CamYawOffset = DegWrap(CamYawOffset + RSx * dt * CAM_YAW_SENS);
-        if (CamYawOffset > CAM_FREELOOK_CLAMP) CamYawOffset = CAM_FREELOOK_CLAMP;
-        if (CamYawOffset < -CAM_FREELOOK_CLAMP) CamYawOffset = -CAM_FREELOOK_CLAMP;
-    }
-
-    // RS.y -> pitch. In scoped mode, use explicit delta and no clamp.
-    if (isScoped) {
-        if (fabsf(g_ScopedPitchDeltaDeg) > 1e-5f) {
-            CamCurrYAngle += g_ScopedPitchDeltaDeg;
-            g_ScopedPitchDeltaDeg = 0.0f;
+        else if (!aimCamNow && wasAimingPrev) {
+            *PlrCurrYAngle = DegWrap(*PlrCurrYAngle + CamYawOffset);
+            CamYawOffset = 0.0f;
         }
-    } else if (fabsf(RSy) > 0.0005f) {
-        CamCurrYAngle += RSy * dt * CAM_PITCH_SENS;
-        // Clamp when not scoped
-        if (CamCurrYAngle > CamMaxYAngle) CamCurrYAngle = CamMaxYAngle;
-        if (CamCurrYAngle < CamMinYAngle) CamCurrYAngle = CamMinYAngle;
-    }
 
-    // Auto-recenter behind player when moving (not aiming) and not steering RS.x
-    CVector2d* LS = (CVector2d*)((char*)This + 1168);
-    float moveMag = (LS) ? sqrtf(LS->x * LS->x + LS->y * LS->y) : 0.0f;
-    if (!aimCamNow && moveMag > 0.15f && fabsf(RSx) < 0.05f && fabsf(CamYawOffset) > 1e-3f) {
-        const float CAM_RECENTER_SPEED = 70.0f; // deg/sec
-        float step = CAM_RECENTER_SPEED * dt;
-        if (fabsf(CamYawOffset) <= step) CamYawOffset = 0.0f;
-        else CamYawOffset += (CamYawOffset > 0.0f ? -step : step);
+        // RS.x -> yaw offset
+        if (fabsf(RSx) > 0.0005f) {
+            CamYawOffset = DegWrap(CamYawOffset + RSx * dt * CAM_YAW_SENS);
+            if (CamYawOffset > CAM_FREELOOK_CLAMP) CamYawOffset = CAM_FREELOOK_CLAMP;
+            if (CamYawOffset < -CAM_FREELOOK_CLAMP) CamYawOffset = -CAM_FREELOOK_CLAMP;
+        }
+
+        // RS.y -> pitch (use aim-vs-freelook clamps)
+        if (fabsf(RSy) > 0.0005f) {
+            CamCurrYAngle += RSy * dt * CAM_PITCH_SENS;
+            const float minLim = aimCamNow ? AIM_PITCH_MIN : CamMinYAngle;
+            const float maxLim = aimCamNow ? AIM_PITCH_MAX : CamMaxYAngle;
+            if (CamCurrYAngle > maxLim) CamCurrYAngle = maxLim;
+            if (CamCurrYAngle < minLim) CamCurrYAngle = minLim;
+        }
+
+        // Auto-recenter when moving and not aiming
+        CVector2d* LS = (CVector2d*)((char*)This + 1168);
+        float moveMag = (LS) ? sqrtf(LS->x * LS->x + LS->y * LS->y) : 0.0f;
+        if (!aimCamNow && moveMag > 0.15f && fabsf(RSx) < 0.05f && fabsf(CamYawOffset) > 1e-3f) {
+            const float CAM_RECENTER_SPEED = 70.0f; // deg/sec
+            float step = CAM_RECENTER_SPEED * dt;
+            if (fabsf(CamYawOffset) <= step) CamYawOffset = 0.0f;
+            else CamYawOffset += (CamYawOffset > 0.0f ? -step : step);
+        }
     }
+    // --- END PATCH: Camera uses weapon-type scoped detection with edge handling ---
+
 
     // Build base camera offset
     CVector CamPosOffsetFromPlayer;
@@ -1153,50 +1496,6 @@ static inline uint32_t Orig_TranslateKeytoAction_body(int keycode)
     return 0;
 }
 
-// ---- Gamepad → DIK mapping used *only* in menus ----
-static bool PadWantsDIK(uint8_t dik)
-{
-    if (!g_XIGetState) return false;
-
-    MH2_XINPUT_STATE st{};
-    if (g_XIGetState(0, &st) != ERROR_SUCCESS) return false;
-
-    const uint16_t wb = st.Gamepad.wButtons;
-    const int DZ = 7849;
-    const float lx = MH2_NormStick(st.Gamepad.sThumbLX, DZ);
-    const float ly = MH2_NormStick(st.Gamepad.sThumbLY, DZ);
-
-    const bool DUp = (wb & XI_DPAD_UP) != 0;
-    const bool DDown = (wb & XI_DPAD_DOWN) != 0;
-    const bool DLeft = (wb & XI_DPAD_LEFT) != 0;
-    const bool DRight = (wb & XI_DPAD_RIGHT) != 0;
-    const bool A = (wb & XI_A) != 0;
-    const bool B = (wb & XI_B) != 0;
-    const bool Start = (wb & XI_START) != 0;
-    const bool Back = (wb & XI_BACK) != 0;
-    const bool LB = (wb & XI_LEFT_SHOULDER) != 0;
-    const bool RB = (wb & XI_RIGHT_SHOULDER) != 0;
-    const bool LT = st.Gamepad.bLeftTrigger > TRIGGER_THRESHOLD;
-    const bool RT = st.Gamepad.bRightTrigger > TRIGGER_THRESHOLD;
-
-    const float TH = 0.55f;
-
-    switch (dik) {
-    case DIK_UP:     return DUp || (ly > TH);
-    case DIK_DOWN:   return DDown || (ly < -TH);
-    case DIK_LEFT:   return DLeft || (lx < -TH);
-    case DIK_RIGHT:  return DRight || (lx > TH);
-    case DIK_RETURN: return A || Start;
-    case DIK_ESCAPE: return B || Back;
-    case DIK_PGUP:   return LB || LT;
-    case DIK_PGDN:   return RB || RT;
-    case DIK_SPACE:  return (wb & XI_X) != 0;
-    case DIK_BACK:   return (wb & XI_Y) != 0;
-    default:         return false;
-    }
-}
-
-
 // put this at file scope once (remove any duplicate you already had)
 static __declspec(thread) bool g_inTKA = false;
 
@@ -1230,21 +1529,6 @@ static tFEConfirm g_FEConfirm_Orig = (tFEConfirm)ADDR_FE_CONFIRM;
 static uint8_t    g_FEConfirmOrigBytes[5] = { 0 };
 static bool       g_FEConfirmHookInstalled = false;
 
-// Same helpers you already have:
-static inline void WriteJump(void* at, void* to) {
-    DWORD old; VirtualProtect(at, 5, PAGE_EXECUTE_READWRITE, &old);
-    uintptr_t rel = (uintptr_t)to - ((uintptr_t)at + 5);
-    uint8_t jmp[5] = { 0xE9, (uint8_t)rel, (uint8_t)(rel >> 8), (uint8_t)(rel >> 16), (uint8_t)(rel >> 24) };
-    memcpy(at, jmp, 5);
-    VirtualProtect(at, 5, old, &old);
-    FlushInstructionCache(GetCurrentProcess(), at, 5);
-}
-static inline void WriteBytes(void* at, const uint8_t* bytes, size_t n) {
-    DWORD old; VirtualProtect(at, n, PAGE_EXECUTE_READWRITE, &old);
-    memcpy(at, bytes, n);
-    VirtualProtect(at, n, old, &old);
-    FlushInstructionCache(GetCurrentProcess(), at, n);
-}
 
 // Our hook: pump XInput->triplets just before FE reads "confirm", then call original.
 static void __fastcall FE_Menu_HandleConfirm_Hook(int menuCtx /*ECX*/)
@@ -1315,6 +1599,8 @@ extern "C" void MH2_XInputGlue_Install() {
     Memory::VP::InjectHook(0x004B0110, TranslateKeytoAction_Hook, PATCH_JUMP);
     InstallPauseMenuHook();
     InstallFEConfirmHook();
+    InstallQtmHudHook();
+
 
     MH2_Log(L"[XInput] Hooks installed.");
 }
