@@ -170,6 +170,12 @@ static float CAM_YAW_SENS = 20.0f; // deg/sec scale
 static float CAM_PITCH_SENS = 20.0f;
 static float AIM_MOUSE_X_SENS_CONFIG = 1500.0f; // pixels/sec at full RS deflection
 static float AIM_MOUSE_Y_SENS_CONFIG = 1000.0f;
+static float CAM_RECENTER_SPEED = 25.0f; // deg/sec when recentering
+
+// NEW: vertical recenter + center target
+static float CAM_RECENTER_SPEED_Y = 25.0f;      // deg/sec for pitch recenter
+static float CAM_VERTICAL_CENTER_DEG = 15.0f;   // neutral freelook pitch
+
 
 // ==== QTM (stealth minigame) detection & control ====
 static bool  g_QtmActive = false;   // live flag
@@ -183,6 +189,13 @@ static float s_QtmMouseYAcc = 0.0f;
 
 static volatile int* const gTripPressedBase = (int*)0x0076BEA4;
 static volatile int* const gTripEndGuard = (int*)0x0076BF18;
+
+// Recenter thresholds
+static const float MOVE_RECENTER_TH = 0.15f;   // LS magnitude needed to auto-recenter
+static const float RS_CANCEL_TH = 0.08f;   // RS magnitude that cancels post-aim recenter when stationary
+static const float YAW_EPS = 0.10f;   // deg, done tolerance
+static const float PITCH_EPS = 0.10f;   // deg, done tolerance
+
 // ===== LOAD CONFIG =====
 
 // Returns the folder of the current DLL (.asi)
@@ -241,6 +254,10 @@ static void MH2_LoadConfig()
         // Sensitivity defaults
         WritePrivateProfileStringW(L"Camera", L"YawSensitivity", L"20.0", g_IniPath);
         WritePrivateProfileStringW(L"Camera", L"PitchSensitivity", L"20.0", g_IniPath);
+        WritePrivateProfileStringW(L"Camera", L"CameraSnapBehindSpeed", L"25.0", g_IniPath);
+        WritePrivateProfileStringW(L"Camera", L"CameraSnapVerticalSpeed", L"5.0", g_IniPath);
+        WritePrivateProfileStringW(L"Camera", L"CameraCenterPitchDeg", L"10.0", g_IniPath);
+
         WritePrivateProfileStringW(L"Aim", L"MouseXSensitivity", L"400.0", g_IniPath);
         WritePrivateProfileStringW(L"Aim", L"MouseYSensitivity", L"800.0", g_IniPath);
 
@@ -271,6 +288,12 @@ static void MH2_LoadConfig()
     CAM_YAW_SENS = (float)_wtof(sensBuf);
     GetPrivateProfileStringW(L"Camera", L"PitchSensitivity", L"20.0", sensBuf, 32, g_IniPath);
     CAM_PITCH_SENS = (float)_wtof(sensBuf);
+    GetPrivateProfileStringW(L"Camera", L"CameraSnapBehindSpeed", L"25.0", sensBuf, 32, g_IniPath);
+    CAM_RECENTER_SPEED = (float)_wtof(sensBuf);
+    GetPrivateProfileStringW(L"Camera", L"CameraSnapVerticalSpeed", L"25.0", sensBuf, 32, g_IniPath);
+    CAM_RECENTER_SPEED_Y = (float)_wtof(sensBuf);
+    GetPrivateProfileStringW(L"Camera", L"CameraCenterPitchDeg", L"15.0", sensBuf, 32, g_IniPath);
+    CAM_VERTICAL_CENTER_DEG = (float)_wtof(sensBuf);
     GetPrivateProfileStringW(L"Aim", L"MouseXSensitivity", L"400.0", sensBuf, 32, g_IniPath);
     AIM_MOUSE_X_SENS_CONFIG = (float)_wtof(sensBuf);
     GetPrivateProfileStringW(L"Aim", L"MouseYSensitivity", L"800.0", sensBuf, 32, g_IniPath);
@@ -908,10 +931,14 @@ static void MH2_UpdateXInputForPlayer(void* playerInst) {
 
     // crawl state (affects movement input path)
     bool isCrawling = false;
+    bool isCrouchMode = false;   // --- BEGIN PATCH: crouch handling ---
+
     if (playerInst) {
         int* PlrCurrState = (int*)((char*)playerInst + 956);
         isCrawling = (PlrCurrState && *PlrCurrState == PEDSTATE_CRAWL);
-    }
+        isCrouchMode = (PlrCurrState && (*PlrCurrState == PEDSTATE_CROUCH || *PlrCurrState == PEDSTATE_CROUCHAIM));
+    } // --- END PATCH
+
 
     if (isCrawling) {
         const float dt = *(float*)0x6ECE68;
@@ -1018,8 +1045,8 @@ static void MH2_UpdateXInputForPlayer(void* playerInst) {
     // Clear the one-frame mute after we processed this frame
     if (g_MuteScopedMouseFrames > 0) --g_MuteScopedMouseFrames;
 
-    *g_LS_X = (isCrawling || firearmAimNow) ? 0.0f : lx;
-    *g_LS_Y = (isCrawling || firearmAimNow) ? 0.0f : ly;
+    *g_LS_X = (isCrawling || firearmAimNow || isCrouchMode) ? 0.0f : lx;
+    *g_LS_Y = (isCrawling || firearmAimNow || isCrouchMode) ? 0.0f : ly;
 
     {
         const float TH = 0.5f;
@@ -1027,30 +1054,27 @@ static void MH2_UpdateXInputForPlayer(void* playerInst) {
         if (fabsf(lx) > 1e-5f || fabsf(ly) > 1e-5f) A |= 0x40000000;
         if (lx < -TH) A |= 0x00040000; else if (lx > TH) A |= 0x00080000;
         if (ly < -TH) A |= 0x00020000; else if (ly > TH) A |= 0x00010000;
-        *g_PadFlags = (isCrawling || firearmAimNow) ? 0u : A;
+        *g_PadFlags = (isCrawling || firearmAimNow || isCrouchMode) ? 0u : A;
     }
+
 
     *g_RS_X = 0.0f; *g_RS_Y = 0.0f;
     if (playerInst) {
         float* L = (float*)((char*)playerInst + 1168);
         float* R = (float*)((char*)playerInst + 1184);
-        L[0] = (isCrawling || firearmAimNow) ? 0.0f : lx;
-        L[1] = (isCrawling || firearmAimNow) ? 0.0f : ly;
+
+        L[0] = (isCrawling || firearmAimNow || isCrouchMode) ? 0.0f : lx;
+        L[1] = (isCrawling || firearmAimNow || isCrouchMode) ? 0.0f : ly;
 
         if (firearmAimNow) {
             if (scopedZoom) {
-                // Scoped/sniper: let native mouse-only scope handle aiming.
-                // Suppress BOTH sticks so the engine does not switch to pad-scope behavior.
                 R[0] = 0.0f; R[1] = 0.0f;
                 L[0] = 0.0f; L[1] = 0.0f;
                 *g_LS_X = 0.0f; *g_LS_Y = 0.0f;
-
-                // Make sure our explicit deltas are not used anywhere.
                 g_ScopedYawDeltaDeg = 0.0f;
                 g_ScopedPitchDeltaDeg = 0.0f;
             }
             else {
-                // Non-scoped firearm aim: mouse drives yaw; keep RS.y for pitch
                 R[0] = 0.0f;
                 R[1] = ry;
             }
@@ -1060,6 +1084,7 @@ static void MH2_UpdateXInputForPlayer(void* playerInst) {
             R[1] = ry;
         }
     }
+
 
     if (firearmAimNow) {
         if (scopedZoom) {
@@ -1106,21 +1131,23 @@ static void MH2_UpdateXInputForPlayer(void* playerInst) {
     if (B)     DesireActionDIKs(ACTION_PICKUP, desired);
     if (Xb)    DesireActionDIKs(ACTION_BLOCK, desired);
     if (L3)    DesireActionDIKs(ACTION_LOOKAROUND, desired);
-    if (R3)    DesireActionDIKs(ACTION_CROUCH, desired);
+    if (R3)    DesireActionDIKs(ACTION_LOOKBACK, desired);
     if (DL)    DesireActionDIKs(ACTION_PEEKL, desired);
     if (DR)    DesireActionDIKs(ACTION_PEEKR, desired);
     if (RT)    DesireActionDIKs(ACTION_FIRE1, desired);
     if (LT)    DesireActionDIKs(ACTION_RUN, desired);
-    if (Start) DesireActionDIKs(ACTION_MENU, desired);
-    if (Back)  DesireActionDIKs(ACTION_LOOKBACK, desired);
 
-    if (isCrawling) {
+    if (Start) DesireActionDIKs(ACTION_MENU, desired);
+    if (Back)  DesireActionDIKs(ACTION_CROUCH, desired);
+
+    // While crawling/crouched/ADS, drive movement with keyboard actions
+    if (isCrawling || firearmAimNow || isCrouchMode) {
         DesireMovementFromStick(lx, ly, desired);
     }
-    
-    // When aiming firearms, use LS for WASD movement instead of analog movement
-    if (firearmAimNow) {
-        DesireMovementFromStick(lx, ly, desired);
+
+    // Optional: block RUN while crouched so LT can’t pop you out of crouch
+    if (!isCrouchMode && LT) {
+        DesireActionDIKs(ACTION_RUN, desired);
     }
 
     ApplyDesiredKeys(desired);
@@ -1252,6 +1279,8 @@ CVector* __fastcall GetGlobalCameraPosFromPlayer(void* This, void*,
     CVector2d* RS = (CVector2d*)((char*)This + 1184);
     const float dt = *(float*)0x6ECE68;
 
+    static bool s_RecenterAfterAim = false;
+
     const float RSx = RS->x * (g_InvertLookX ? -1.0f : 1.0f);
     const float RSy = RS->y * (g_InvertLookY ? -1.0f : 1.0f);
 
@@ -1263,23 +1292,18 @@ CVector* __fastcall GetGlobalCameraPosFromPlayer(void* This, void*,
     const bool firearmAimNoMouse = hasFirearmNow && (rmbHeld || inAimState);
     const bool lbRotateNoGun = rmbHeld && !hasFirearmNow;
     const bool aimCamNow = (firearmAimNoMouse || lbRotateNoGun);
-    
-    // --- BEGIN PATCH: Camera uses weapon-type scoped detection with edge handling ---
-     // Check if we're scoped - 2H firearm while actively aiming
+
+    // --- Scoped detection and aim edges ---
     const bool isScoped =
         hasFirearmNow &&
         (*PlrCurrWpnType == WEAPONTYPE_2HFIREARM) &&
         (rmbHeld || inAimState);
 
-    // Track generic aim state (freelook / ADS) separately from scope
     const bool wasAimingPrev = WasAiming;
     WasAiming = aimCamNow;
 
-    // Scoped rising/falling edge handled ONLY here (camera side)
     static bool sWasScopedCam = false;
     if (!sWasScopedCam && isScoped) {
-        // Entering scope: commit freelook yaw into engine once, zero yaw offset,
-        // then initialize engine aim pitch from our freelook pitch + optional bias.
         *PlrCurrYAngle = DegWrap(*PlrCurrYAngle + CamYawOffset);
         CamYawOffset = 0.0f;
 
@@ -1287,24 +1311,18 @@ CVector* __fastcall GetGlobalCameraPosFromPlayer(void* This, void*,
         MH2_Log(L"[Cam] Scoped entry -> yaw committed, pitch baseline=%.2f (bias=%.2f)", CamCurrYAngle, g_ScopedPitchBiasDeg);
     }
     else if (sWasScopedCam && !isScoped) {
-        // Exiting scope: bring engine aim pitch back to freelook
         CamCurrYAngle = *PlrCurrYAngle;
         MH2_Log(L"[Cam] Scoped exit -> freelook pitch=%.2f", CamCurrYAngle);
     }
     sWasScopedCam = isScoped;
 
     if (isScoped) {
-        // While scoped, engine mouse handling owns the camera.
         CamYawOffset = 0.0f;
         CamCurrYAngle = *PlrCurrYAngle;
-
-        // (Keep deltas clear — not used while scoped.)
         g_ScopedYawDeltaDeg = 0.0f;
         g_ScopedPitchDeltaDeg = 0.0f;
     }
     else {
-        // IMPORTANT: do not run the generic aim yaw-commit on scope enter/exit.
-        // Only commit on non-scoped aim enter/exit:
         if (aimCamNow && !wasAimingPrev) {
             *PlrCurrYAngle = DegWrap(*PlrCurrYAngle + CamYawOffset);
             CamYawOffset = 0.0f;
@@ -1312,6 +1330,8 @@ CVector* __fastcall GetGlobalCameraPosFromPlayer(void* This, void*,
         else if (!aimCamNow && wasAimingPrev) {
             *PlrCurrYAngle = DegWrap(*PlrCurrYAngle + CamYawOffset);
             CamYawOffset = 0.0f;
+            // Start post-aim recenter routine
+            s_RecenterAfterAim = true;
         }
 
         // RS.x -> yaw offset
@@ -1321,7 +1341,7 @@ CVector* __fastcall GetGlobalCameraPosFromPlayer(void* This, void*,
             if (CamYawOffset < -CAM_FREELOOK_CLAMP) CamYawOffset = -CAM_FREELOOK_CLAMP;
         }
 
-        // RS.y -> pitch (use aim-vs-freelook clamps)
+        // RS.y -> pitch with proper clamp
         if (fabsf(RSy) > 0.0005f) {
             CamCurrYAngle += RSy * dt * CAM_PITCH_SENS;
             const float minLim = aimCamNow ? AIM_PITCH_MIN : CamMinYAngle;
@@ -1330,18 +1350,47 @@ CVector* __fastcall GetGlobalCameraPosFromPlayer(void* This, void*,
             if (CamCurrYAngle < minLim) CamCurrYAngle = minLim;
         }
 
-        // Auto-recenter when moving and not aiming
+        // Compute movement magnitude once
         CVector2d* LS = (CVector2d*)((char*)This + 1168);
-        float moveMag = (LS) ? sqrtf(LS->x * LS->x + LS->y * LS->y) : 0.0f;
-        if (!aimCamNow && moveMag > 0.15f && fabsf(RSx) < 0.05f && fabsf(CamYawOffset) > 1e-3f) {
-            const float CAM_RECENTER_SPEED = 70.0f; // deg/sec
-            float step = CAM_RECENTER_SPEED * dt;
+        const float moveMag = (LS) ? sqrtf(LS->x * LS->x + LS->y * LS->y) : 0.0f;
+
+        // Interrupt post-aim recenter if player is stationary and nudges camera
+        const bool rsCancel = (fabsf(RSx) > RS_CANCEL_TH) || (fabsf(RSy) > RS_CANCEL_TH);
+        if (s_RecenterAfterAim && moveMag <= MOVE_RECENTER_TH && rsCancel) {
+            s_RecenterAfterAim = false; // cancel on manual camera input while stationary
+        }
+
+        // Prepare vertical center target
+        float centerPitch = CAM_VERTICAL_CENTER_DEG;
+        if (centerPitch < CamMinYAngle) centerPitch = CamMinYAngle;
+        if (centerPitch > CamMaxYAngle) centerPitch = CamMaxYAngle;
+
+        // Recenter while moving, or if post-aim recenter is active. Only when RS is idle.
+        const bool canRecenterYaw = (!aimCamNow) && (fabsf(RSx) < 0.05f) && (fabsf(CamYawOffset) > 1e-3f);
+        const bool canRecenterPitch = (!aimCamNow) && (fabsf(RSy) < 0.05f) && (fabsf(CamCurrYAngle - centerPitch) > 1e-3f);
+        const bool wantMoveRecenter = (moveMag > MOVE_RECENTER_TH);
+        const bool wantPostAim = s_RecenterAfterAim;
+
+        if ((wantMoveRecenter || wantPostAim) && canRecenterYaw) {
+            const float step = CAM_RECENTER_SPEED * dt;
             if (fabsf(CamYawOffset) <= step) CamYawOffset = 0.0f;
             else CamYawOffset += (CamYawOffset > 0.0f ? -step : step);
         }
-    }
-    // --- END PATCH: Camera uses weapon-type scoped detection with edge handling ---
 
+        if (!aimCamNow && (wantMoveRecenter || wantPostAim) && canRecenterPitch) {
+            const float stepY = CAM_RECENTER_SPEED_Y * dt;
+            const float errY = CamCurrYAngle - centerPitch;
+            if (fabsf(errY) <= stepY) CamCurrYAngle = centerPitch;
+            else CamCurrYAngle += (errY > 0.0f ? -stepY : stepY);
+        }
+
+        // Auto-finish post-aim recenter when both axes are at target
+        if (s_RecenterAfterAim) {
+            const bool yawDone = fabsf(CamYawOffset) <= YAW_EPS;
+            const bool pitchDone = fabsf(CamCurrYAngle - centerPitch) <= PITCH_EPS;
+            if (yawDone && pitchDone) s_RecenterAfterAim = false;
+        }
+    }
 
     // Build base camera offset
     CVector CamPosOffsetFromPlayer;
@@ -1427,6 +1476,7 @@ CVector* __fastcall GetGlobalCameraPosFromPlayer(void* This, void*,
 
     return camPos;
 }
+
 
 // Keep instant aim interpolation
 void __cdecl InterpolateAimAngle(float* curAngle, float* /*angleDelta*/, float targetAngle, float /*speed*/, float /*minDelta*/) {
